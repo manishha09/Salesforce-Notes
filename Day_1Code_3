@@ -1,0 +1,27 @@
+Program 3 — Map of Account by Id (the auto-keying constructor)
+
+// The idiomatic shortcut: pass a query straight into the Map<Id, sObject>
+// constructor and it auto-keys every record by its Id.
+Map<Id, Account> accById = new Map<Id, Account>(
+    [SELECT Id, Name, Industry FROM Account LIMIT 10]
+);
+
+System.debug('Accounts loaded: ' + accById.size());
+System.debug('All Ids (keySet): ' + accById.keySet());
+
+// O(1) lookup by Id
+for (Id accId : accById.keySet()) {
+    Account a = accById.get(accId);
+    System.debug(a.Name + ' | ' + a.Industry);
+}
+
+// .get() on a missing key returns null (it does NOT throw)
+Id fakeId = '001000000000000AAA';
+Account missing = accById.get(fakeId);
+System.debug('Missing lookup: ' + missing);   // null
+
+// values() gives you a List<Account> when you need to iterate or DML them
+List<Account> allAccts = accById.values();
+System.debug('Values count: ' + allAccts.size());
+
+If your org has no Accounts, this loads nothing — create one first (insert new Account(Name='Test');) or the map will be empty.
