@@ -1,0 +1,121 @@
+Primitive Data Types 
+
+Apex primitives are Integer, Long, Double, Decimal, Boolean, String, Id, Blob, Date, Datetime, and Time. The numeric ones are worth distinguishing:
+
+Integer — 32-bit signed (~±2.1 billion). Long — 64-bit, for anything bigger.
+Decimal — arbitrary fixed precision, the correct choice for currency and anything where rounding matters. All currency/number fields from records come back as Decimal.
+Double — 64-bit floating point; fine for scientific math, wrong for money.
+
+The single biggest difference from Java: every Apex variable can be null, including Integer and Boolean. 
+There's no unboxed primitive. An unassigned Integer i; is null, not 0. This matters constantly for null handling (below).
+
+Also watch integer division — 5 / 2 is 2, not 2.5. Cast a operand first: 5 / (Decimal)2 or 5.0 / 2.
+apexInteger count;              // null, not 0
+Decimal price = 19.99;
+Boolean isActive;          // null, not false
+Id recordId = '001xx000003DGb2AAG';
+
+
+
+Collections
+List — ordered, indexed, allows duplicates. Your default collection. sObject[] array syntax is interchangeable with List<sObject>.
+apexList<String> names = new List<String>{'a', 'b', 'a'};
+String[] alsoList = new String[]{'x', 'y'};  // same thing
+names.add('c');
+String first = names[0];
+
+Set — unordered, unique elements, no index access. Great for deduping and for membership checks (mySet.contains(x)), and for gathering Ids to feed into a SOQL WHERE Id IN :mySet.
+apexSet<Id> accountIds = new Set<Id>();
+for (Contact c : contacts) accountIds.add(c.AccountId);  // auto-dedupes
+
+
+Map — key/value, unique keys. The idiomatic Apex pattern is bulkifying with maps to avoid queries in loops. 
+A very common shortcut: passing a SOQL query straight into a Map<Id, sObject> constructor auto-keys by record Id.
+apexMap<Id, Account> accById = new Map<Id, Account>(
+    [SELECT Id, Name FROM Account WHERE Id IN :accountIds]
+);
+Account a = accById.get(someId);   // returns null if key absent
+Note map.get(missingKey) returns null rather than throwing, whereas list[badIndex] throws ListException.
+
+
+TYPE CASTING 
+
+Widening is implicit (Integer → Long → Double, Integer → Decimal). Narrowing and sObject downcasting need explicit casts:
+apexObject o = 'hello';
+String s = (String) o;
+
+SObject so = [SELECT Id, Name FROM Account LIMIT 1];
+Account acc = (Account) so;   // downcast generic sObject
+Keep two mechanisms distinct:
+
+Casting (Integer) someObject — reinterprets an existing reference; throws TypeException if the runtime type doesn't match.
+Parsing/conversion Integer.valueOf('42'), String.valueOf(someDecimal), Decimal.valueOf('3.14') — actually converts between representations. Integer.valueOf('abc') throws, so validate first.
+
+Use instanceof before a risky downcast:
+apexif (o instanceof Account) {
+    Account a = (Account) o;
+}
+
+Null handling
+
+Because everything can be null, null-safety is where most runtime NullPointerExceptions come from. Three modern operators help a lot:
+Safe navigation ?. (API 51.0+) short-circuits to null instead of throwing:
+apexString city = contact?.Account?.BillingCity;   // null if contact or Account is null
+Integer n = myList?.size();                     // null if myList is null
+Null coalescing ?? (API 59.0+) supplies a fallback:
+apexInteger qty = record.Quantity__c ?? 0;
+String label = input ?? 'default';
+For strings, prefer the built-in checks over manual null comparisons, since they handle null and empty/whitespace in one call:
+apexString.isBlank(s)    // true if null, '', or only whitespace
+String.isEmpty(s)    // true if null or '' (whitespace counts as non-empty)
+String.isNotBlank(s)
+One more distinction that bites people: a null collection and an empty collection aren't the same. Iterating a null list throws; iterating an empty one is a no-op. 
+If a variable might be null, either initialize it up front (new List<...>()) or guard with ?./a null check before looping.
+If you want, I can turn any of these into a runnable trigger/class example, or go deeper on the bulkification patterns where maps and sets really earn their keep.
+
+
+What is Apex?
+
+Apex is Salesforce's proprietary, cloud-hosted programming language. 
+It's strongly typed and object-oriented, with a Java-like syntax, and it runs entirely on Salesforce servers (you can't run it locally — it executes on the Lightning Platform). 
+Its whole reason for existing is to let you add custom business logic to Salesforce: things that fire when records are saved (triggers), 
+custom REST endpoints, batch jobs, scheduled jobs, and the server-side controllers behind Lightning/Visualforce UIs.
+The defining trait is that it's database-integrated and multi-tenant-governed. 
+SOQL and DML are first-class parts of the language — you write [SELECT Id FROM Account] or insert acc; directly, no ORM, no connection strings. 
+And because thousands of customers share the same infrastructure, Salesforce enforces governor limits: hard caps per transaction (e.g. 100 SOQL queries, 150 DML statements, 6 MB heap, 10-second CPU). 
+Blow a limit and the transaction throws and rolls back. This single fact shapes almost every idiom in the language.
+
+
+Difference between Apex and Java 
+
+Here's that comparison in paragraph form:
+Apex and Java differ in where they run before anything else: Apex executes exclusively on Salesforce's servers, while Java runs anywhere a JVM is available. 
+They also handle case differently — Apex is case-insensitive (so Integer COUNT and integer count are the same variable), whereas Java is strictly case-sensitive.
+Primitives behave differently too. 
+In Apex, every primitive is nullable, so an unassigned Integer is null rather than 0. Java's unboxed primitives, by contrast, can never be null. Database access is another key divide: 
+Apex builds SOQL and DML directly into the language syntax, so you can write a query or an insert statement natively, 
+while Java relies on external JDBC drivers or ORM libraries to talk to a database.
+Resource constraints diverge sharply as well. 
+Apex enforces governor limits — hard caps on things like queries, DML statements, and CPU time per transaction — because it runs in a shared, multi-tenant environment. 
+Java has no such platform-imposed ceiling; it's bounded only by the hardware and JVM configuration it runs on. Concurrency follows a similar pattern: Apex has no thread model and no Runnable-style constructs, 
+with asynchronous work instead handled through platform-specific features like batch or queueable jobs, whereas Java offers a full, general-purpose threading model.
+
+List vs. Set vs. Map
+Here's the decision in one line each, then the reasoning:
+Use a List when order matters or duplicates are allowed — which is most of the time. Query results come back as Lists, DML operates on Lists (insert myList;), and anything you iterate in sequence is a List. It's your default.
+Use a Set when you need uniqueness or fast membership tests. The classic case is gathering foreign keys before a query: loop over contacts, add() each AccountId to a Set<Id> (duplicates collapse automatically), then WHERE AccountId IN :accountIdSet. 
+Also reach for it whenever you'd otherwise write "have I seen this before?" logic — mySet.contains(x) is the tool.
+Use a Map when you need to look something up by a key. This is the heart of bulkification. 
+You have records in one context and need the related record for each without querying in a loop, so you build a Map<Id, SomeObject> once and do O(1) .get(id) lookups inside the loop. 
+The Map<Id, sObject> constructor that auto-keys a query by record Id exists precisely because this pattern is so common.
+
+A quick way to choose:
+
+Do I just need to hold things in order / pass them to DML? → List
+Do I need "unique values" or "is X in here?" → Set
+Do I need "given X, find its Y"? → Map
+
+They compose constantly in real triggers: iterate a List of incoming records, collect parent Ids into a Set, query using that Set, load results into a Map, then iterate the original List again doing Map lookups. 
+That four-line dance is probably 80% of what maps and sets get used for in Apex.
+Want me to write out that full bulkified-trigger pattern as a concrete example? It ties all three collections together and makes the "why" click.
+
