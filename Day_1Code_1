@@ -1,0 +1,26 @@
+// Program 1 — List operations tour
+
+// Core List methods you'll actually use
+List<String> fruits = new List<String>{'apple', 'banana', 'cherry'};
+
+fruits.add('date');                    // append
+fruits.add(0, 'apricot');              // insert at index
+fruits.set(1, 'APPLE');                // overwrite index 1
+
+System.debug('Size: ' + fruits.size());          // 5
+System.debug('First: ' + fruits[0]);             // apricot
+System.debug('Contains cherry? ' + fruits.contains('cherry'));  // true
+System.debug('Index of date: ' + fruits.indexOf('date'));       // 4
+
+fruits.remove(0);                      // remove by index, returns removed elem
+fruits.sort();                         // in-place alphabetical sort
+System.debug('Sorted: ' + fruits);
+
+// Iterate
+for (String f : fruits) {
+    System.debug('Fruit -> ' + f);
+}
+
+System.debug('Empty? ' + fruits.isEmpty());   // false
+fruits.clear();
+System.debug('After clear: ' + fruits.size()); // 0
