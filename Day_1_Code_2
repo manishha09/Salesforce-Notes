@@ -1,0 +1,25 @@
+Set to remove duplicates
+
+// A Set silently drops duplicates on insert
+List<String> emailsWithDupes = new List<String>{
+    'a@x.com', 'b@x.com', 'a@x.com', 'c@x.com', 'B@X.COM', 'b@x.com'
+};
+
+Set<String> uniqueEmails = new Set<String>();
+uniqueEmails.addAll(emailsWithDupes);   // bulk add; dupes collapse
+
+System.debug('Original count: ' + emailsWithDupes.size());  // 6
+System.debug('Unique count: '   + uniqueEmails.size());     // 4
+System.debug('Unique set: '     + uniqueEmails);
+
+// Gotcha: Sets are case-SENSITIVE for Strings.
+// 'B@X.COM' and 'b@x.com' are treated as different here.
+// To dedupe case-insensitively, normalize first:
+Set<String> normalized = new Set<String>();
+for (String e : emailsWithDupes) {
+    normalized.add(e.toLowerCase());
+}
+System.debug('Case-insensitive unique: ' + normalized.size());  // 3
+
+// Convert back to a List when you need order/indexing or DML:
+List<String> backToList = new List<String>(uniqueEmails);
