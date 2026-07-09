@@ -1,0 +1,28 @@
+Program 5 — All three together: the bulkification pattern
+
+// The real-world workflow: List -> Set -> query -> Map -> loop.
+// Goal: for each Contact, stamp its parent Account's Name onto a field.
+
+List<Contact> contacts = [
+    SELECT Id, FirstName, AccountId FROM Contact
+    WHERE AccountId != null LIMIT 50
+];
+
+// 1) LIST -> SET: collect unique parent Ids (dedupes automatically)
+Set<Id> parentIds = new Set<Id>();
+for (Contact c : contacts) {
+    parentIds.add(c.AccountId);
+}
+System.debug('Contacts: ' + contacts.size() + ', unique parents: ' + parentIds.size());
+
+// 2) ONE query using the Set -> auto-keyed MAP
+Map<Id, Account> parents = new Map<Id, Account>(
+    [SELECT Id, Name FROM Account WHERE Id IN :parentIds]
+);
+
+// 3) Loop the original List, doing O(1) MAP lookups (no query in loop!)
+for (Contact c : contacts) {
+    Account parent = parents.get(c.AccountId);   // safe: returns null if absent
+    String parentName = parent?.Name ?? '(no account)';
+    System.debug(c.FirstName + ' -> ' + parentName);
+}
