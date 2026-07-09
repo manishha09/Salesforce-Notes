@@ -1,0 +1,22 @@
+Program 4 — Manually building a Map by a non-Id key
+
+  // Auto-keying only works by record Id. To key by any OTHER field,
+// build the map yourself in a loop.
+List<Account> accounts = [SELECT Id, Name, Industry FROM Account LIMIT 20];
+
+// Group account Names by Industry:  Industry -> List of names
+Map<String, List<String>> namesByIndustry = new Map<String, List<String>>();
+
+for (Account a : accounts) {
+    String key = a.Industry ?? 'Unknown';   // null-coalesce the key
+
+    // Standard "get-or-create the bucket" pattern
+    if (!namesByIndustry.containsKey(key)) {
+        namesByIndustry.put(key, new List<String>());
+    }
+    namesByIndustry.get(key).add(a.Name);
+}
+
+for (String industry : namesByIndustry.keySet()) {
+    System.debug(industry + ': ' + namesByIndustry.get(industry));
+}
