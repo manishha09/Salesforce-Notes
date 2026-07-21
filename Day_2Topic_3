@@ -1,0 +1,180 @@
+// ═══════════════════════════════════════════════════════════════
+// 1. BASIC — WHERE + ORDER BY + LIMIT
+// The bread-and-butter query. Filter, sort, cap the rows.
+// ═══════════════════════════════════════════════════════════════
+List<Account> q1 = [
+    SELECT Id, Name, Industry, AnnualRevenue
+    FROM Account
+    WHERE AnnualRevenue > 1000000
+    ORDER BY AnnualRevenue DESC
+    LIMIT 10
+];
+System.debug('Q1 rows: ' + q1.size());
+
+
+// ═══════════════════════════════════════════════════════════════
+// 2. PAGINATION — WHERE + LIMIT + OFFSET
+// OFFSET skips the first N rows. Page 2 of a 10-per-page list.
+// OFFSET is capped at 2000; pair it with a stable ORDER BY.
+// ═══════════════════════════════════════════════════════════════
+Integer pageSize = 10;
+Integer pageNum  = 2;
+List<Account> q2 = [
+    SELECT Id, Name
+    FROM Account
+    WHERE Industry != null
+    ORDER BY Name ASC
+    LIMIT :pageSize
+    OFFSET :(pageSize * (pageNum - 1))   // skips first 10
+];
+System.debug('Q2 (page 2) rows: ' + q2.size());
+
+
+// ═══════════════════════════════════════════════════════════════
+// 3. CHILD-TO-PARENT — dot notation, traversing "up"
+// From Contact up to its Account, and up again to the Account owner.
+// Up to 5 levels of parent traversal are allowed.
+// ═══════════════════════════════════════════════════════════════
+List<Contact> q3 = [
+    SELECT Id, LastName,
+           Account.Name, Account.Industry, Account.Owner.Email
+    FROM Contact
+    WHERE Account.AnnualRevenue > 500000
+    LIMIT 20
+];
+for (Contact c : q3) {
+    System.debug(c.LastName + ' @ ' + c.Account?.Name);
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// 4. PARENT-TO-CHILD — subquery, traversing "down"
+// One Account carries its list of Contacts inline (relationship name).
+// The inner query has its own WHERE/ORDER BY/LIMIT.
+// ═══════════════════════════════════════════════════════════════
+List<Account> q4 = [
+    SELECT Id, Name,
+        (SELECT Id, LastName, Email
+         FROM Contacts
+         WHERE Email != null
+         ORDER BY LastName
+         LIMIT 5)
+    FROM Account
+    WHERE Id IN (SELECT AccountId FROM Contact)   // only accounts that have contacts
+    LIMIT 10
+];
+for (Account a : q4) {
+    System.debug(a.Name + ' has ' + a.Contacts.size() + ' contact(s)');
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// 5. SEMI-JOIN — the SOQL "inner join" (IN + subquery)
+// "Accounts that HAVE at least one Opportunity." The subquery returns
+// a set of AccountIds; the outer query keeps only matching parents.
+// ═══════════════════════════════════════════════════════════════
+List<Account> q5 = [
+    SELECT Id, Name
+    FROM Account
+    WHERE Id IN (SELECT AccountId FROM Opportunity WHERE StageName = 'Closed Won')
+    LIMIT 20
+];
+System.debug('Q5 (accounts with a won opp): ' + q5.size());
+
+
+// ═══════════════════════════════════════════════════════════════
+// 6. ANTI-JOIN — the inverse (NOT IN + subquery)
+// "Accounts with NO Contacts." The other half of the join story.
+// ═══════════════════════════════════════════════════════════════
+List<Account> q6 = [
+    SELECT Id, Name
+    FROM Account
+    WHERE Id NOT IN (SELECT AccountId FROM Contact WHERE AccountId != null)
+    LIMIT 20
+];
+System.debug('Q6 (accounts with no contacts): ' + q6.size());
+
+
+// ═══════════════════════════════════════════════════════════════
+// 7. AGGREGATE — COUNT + GROUP BY
+// Returns AggregateResult[], NOT Account[]. Pull values by alias.
+// ═══════════════════════════════════════════════════════════════
+List<AggregateResult> q7 = [
+    SELECT Industry, COUNT(Id) acctCount
+    FROM Account
+    WHERE Industry != null
+    GROUP BY Industry
+    ORDER BY COUNT(Id) DESC
+    LIMIT 10
+];
+for (AggregateResult ar : q7) {
+    System.debug(ar.get('Industry') + ': ' + ar.get('acctCount'));
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// 8. AGGREGATE — SUM/AVG/MIN/MAX + GROUP BY + HAVING
+// HAVING filters AFTER grouping (WHERE filters before).
+// Grouping opportunities by stage, keeping only sizable groups.
+// ═══════════════════════════════════════════════════════════════
+List<AggregateResult> q8 = [
+    SELECT StageName,
+           COUNT(Id) numOpps,
+           SUM(Amount) totalAmt,
+           AVG(Amount) avgAmt,
+           MAX(Amount) biggest
+    FROM Opportunity
+    WHERE Amount != null
+    GROUP BY StageName
+    HAVING COUNT(Id) > 2
+    ORDER BY SUM(Amount) DESC
+];
+for (AggregateResult ar : q8) {
+    System.debug(
+        ar.get('StageName') + ' | count=' + ar.get('numOpps') +
+        ' | total=' + ar.get('totalAmt') + ' | avg=' + ar.get('avgAmt')
+    );
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// 9. AGGREGATE ACROSS A RELATIONSHIP — GROUP BY a parent field
+// Group child Opportunities by their parent Account's Industry.
+// Note the dot-path both in SELECT and GROUP BY.
+// ═══════════════════════════════════════════════════════════════
+List<AggregateResult> q9 = [
+    SELECT Account.Industry ind, SUM(Amount) pipeline
+    FROM Opportunity
+    WHERE Account.Industry != null AND Amount != null
+    GROUP BY Account.Industry
+    ORDER BY SUM(Amount) DESC
+    LIMIT 10
+];
+for (AggregateResult ar : q9) {
+    System.debug('Industry ' + ar.get('ind') + ' pipeline: ' + ar.get('pipeline'));
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// 10. THE WORKS — bind vars + date literal + IN + multi-clause WHERE
+// Combines bind variables, a relative date literal, a semi-join,
+// and ordering/pagination in one realistic query.
+// ═══════════════════════════════════════════════════════════════
+Set<String> targetStages = new Set<String>{'Prospecting', 'Negotiation/Review'};
+Decimal minAmount = 10000;
+
+List<Opportunity> q10 = [
+    SELECT Id, Name, Amount, StageName, CloseDate, Account.Name
+    FROM Opportunity
+    WHERE StageName IN :targetStages
+      AND Amount >= :minAmount
+      AND CloseDate = THIS_YEAR
+      AND AccountId IN (SELECT Id FROM Account WHERE Industry = 'Technology')
+    ORDER BY CloseDate ASC, Amount DESC
+    LIMIT 25
+    OFFSET 0
+];
+System.debug('Q10 rows: ' + q10.size());
+for (Opportunity o : q10) {
+    System.debug(o.Name + ' | ' + o.StageName + ' | ' + o.Amount + ' | ' + o.Account?.Name);
+}
