@@ -1,0 +1,133 @@
+SOQL vs. SOSL
+
+They solve different problems, and the cleanest way to hold the distinction is: SOQL retrieves records; SOSL searches text.
+
+SOQL (Salesforce Object Query Language) queries one object at a time (plus its relationships) and filters on exact field values. 
+You know the object, you know the fields, you're asking "give me the records where these conditions are true." 
+It queries all fields regardless of whether they're indexed for search, and it's what you use for anything precise — WHERE Industry = 'Tech' AND AnnualRevenue > 1000000.
+
+SOSL (Salesforce Object Search Language) does full-text search across multiple objects at once. 
+You're not filtering on a specific field value; you're looking for a term appearing anywhere in the searchable text of the records. 
+It hits a search index rather than scanning field values, which is why it's far more efficient for keyword-style lookups across long-text fields.
+
+Here's the same "find Acme" intent in both, to make the shape concrete:
+
+apex
+// SOQL — one object, field-value match, LIKE scans
+List<Account> a = [SELECT Id, Name FROM Account WHERE Name LIKE '%Acme%'];
+
+// SOSL — many objects, indexed text search
+List<List<sObject>> results = [
+    FIND 'Acme*' IN NAME FIELDS
+    RETURNING Account(Id, Name), Contact(Id, LastName), Lead(Id, Company)
+];
+
+The practical decision table:
+	                                           SOQL	                                                            SOSL
+Purpose	                        Retrieve records by field criteria	                                  Search text across objects
+Objects                         per statement	One (+ relationships)	Multiple,                         unrelated
+Matching	                      Exact field values, LIKE	                                            Indexed full-text, tokenized
+Returns	                        List<sObject>	                                                        List<List<sObject>>
+Aggregates / relationships	    Yes (GROUP BY, subqueries)	                                          No
+Governor limit / txn	          100 queries	                                                          20 searches
+Best at	                        Precise,structured filtering	                                        "Find this word somewhere"
+
+
+Two things worth internalizing beyond the table. First, SOSL returns a list of lists — one inner list per object in your RETURNING clause, 
+in that order — because it's searching several objects simultaneously. 
+Second, the performance angle: if you find yourself writing several LIKE '%term%' SOQL queries across different objects to implement a search box, that's the signal to switch to a single SOSL search. 
+Leading-wildcard LIKE can't use indexes; SOSL is built on the search index. 
+There's also a data-freshness caveat — the search index updates asynchronously, so a record created microseconds ago might not be findable via SOSL yet, whereas SOQL sees it immediately.
+*********************************************************************************************************************************************************************************************************************************
+
+Relationship queries
+
+Relationship queries let you traverse the associations between objects in a single query instead of issuing separate queries and stitching results together in Apex. They come in two directions, and the direction dictates the syntax.
+
+Child-to-parent (traversing "up") — from a record to the record it belongs to. You use dot notation on the relationship field, up to 5 levels deep. A Contact belongs to an Account, so:
+
+apex
+List<Contact> contacts = [
+    SELECT Id, LastName, Account.Name, Account.Owner.Email
+    FROM Contact
+    WHERE Account.Industry = 'Technology'
+];
+System.debug(contacts[0].Account.Name);
+
+Each Contact carries its parent Account inline. Note you can even filter on parent fields in the WHERE.
+
+Parent-to-child (traversing "down") — from a record to the collection of records that belong to it. You use a nested subquery, and you reference the children by the relationship name (usually the plural for standard objects):
+
+apex
+List<Account> accts = [
+    SELECT Id, Name,
+        (SELECT Id, LastName FROM Contacts WHERE Email != null)
+    FROM Account
+];
+for (Account a : accts) {
+    for (Contact c : a.Contacts) {   // the child list rides along
+        System.debug(a.Name + ' -> ' + c.LastName);
+    }
+}
+
+The naming rule that trips everyone up: child-to-parent for custom relationships uses __r (e.g. Invoice__r.Name) even though the field is __c, 
+and the parent-to-child subquery uses the relationship name (typically Line_Items__r), not the object API name (Line_Item__c). 
+When Salesforce says "didn't understand the relationship," it's almost always this naming issue.
+
+Why this matters so much in Apex: relationship queries are a bulkification and governor-limit tool. 
+Instead of querying Accounts and then querying Contacts in a loop (which blows your query limit), one relationship query pulls both in a single count against your 100-query budget.
+*******************************************************************************************************************************************************************************************************************************************************
+
+Polymorphic relationships
+
+A polymorphic relationship is a lookup that can point to more than one type of object. The parent isn't fixed to a single sObject type — different records can have parents of different types.
+
+The canonical examples are standard fields:
+
+Task.WhatId / Event.WhatId — a task's "related to" can be an Account, Opportunity, Case, or a custom object.
+Task.WhoId / Event.WhoId — can point to a Contact or a Lead.
+Lead.OwnerId, Case.OwnerId, etc. — an owner can be a User or a Queue (Group).
+
+Because the type varies per record, you handle it specially in SOQL using the TYPEOF clause (SOQL polymorphism), which lets you select different fields depending on what the related record actually is:
+
+apex
+List<Task> tasks = [
+    SELECT Id, Subject,
+        TYPEOF What
+            WHEN Account THEN Name, Industry, AnnualRevenue
+            WHEN Opportunity THEN Amount, StageName, CloseDate
+            ELSE Id, Name
+        END
+    FROM Task
+];
+
+TYPEOF says: "if the What is an Account, give me these Account fields; if it's an Opportunity, give me those Opportunity fields." 
+You can't just write What.Amount unconditionally, because that field only exists when the parent is an Opportunity.
+
+In Apex code, you then check the concrete type at runtime before casting — because the compiler can't know it:
+
+apex
+for (Task t : tasks) {
+    if (t.What instanceof Account) {
+        Account a = (Account) t.What;
+        System.debug('Account: ' + a.Name);
+    } else if (t.What instanceof Opportunity) {
+        Opportunity o = (Opportunity) t.What;
+        System.debug('Opp amount: ' + o.Amount);
+    }
+}
+
+You can also filter polymorphic relationships by type using the special Type qualifier in a WHERE clause:
+
+apex
+List<Task> accountTasks = [
+    SELECT Id, Subject, What.Name
+    FROM Task
+    WHERE What.Type = 'Account'
+];
+
+The mental model: a normal lookup is a single-type foreign key; a polymorphic lookup is a foreign key whose target type is data, so both SOQL (TYPEOF) and Apex (instanceof + cast) need a branching mechanism to deal with the type varying record by record.
+
+A tidy way to connect all three: relationship queries are how SOQL traverses associations, 
+polymorphic relationships are the special case where the association's type isn't fixed (needing TYPEOF), and SOSL sits outside this entirely as the text-search tool for when you don't know the object or you're searching keywords across many. 
+Want me to build a single runnable example — say, a Task query that traverses to both Contact (Who) and Account (What) polymorphically — so you can see TYPEOF and the instanceof handling together in anonymous Apex?
