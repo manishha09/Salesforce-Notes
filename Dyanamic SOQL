@@ -1,0 +1,430 @@
+Dynamic SOQL — The Complete Picture
+What it is and why it exists
+
+Every SOQL query you've written so far has been static — enclosed in square brackets, with the object, fields, and filters fixed at compile time:
+
+apex
+List<Account> accts = [SELECT Id, Name FROM Account WHERE Industry = 'Tech'];
+
+The compiler validates this at save time. If you misspell Industry or the field gets deleted, the code won't even compile. That's a huge safety net.
+
+Dynamic SOQL gives that safety net up in exchange for flexibility: you build the query as an ordinary String at runtime and execute it with Database.query().
+Nothing about it is checked until the moment it runs.
+
+When do you genuinely need this?
+
+User-driven filters — a search page where the user picks which fields to filter on and what values to use. You can't write a static query for every combination.
+Configurable object or field names — a generic utility that works on any sObject ("export any object to CSV," "audit any object's records"), or field names stored in Custom Metadata.
+Conditionally assembled clauses — the WHERE clause has 2 pieces sometimes and 6 pieces other times, depending on inputs.
+Managed packages / frameworks — code that must run in orgs whose schema you don't know at build time.
+
+If the query can be static, make it static. Dynamic SOQL is the fallback, not the default — you lose compile-time validation, you take on injection risk, and the code is harder to read. 
+That's the rule of thumb to carry.
+
+**********************************************************************************************************************************************************************************************************************
+
+The core mechanism: Database.query()
+apex
+String q = 'SELECT Id, Name FROM Account LIMIT 10';
+List<Account> accts = Database.query(q);
+
+Things to know about the return value:
+
+Its declared return type is List<sObject>, but Apex will happily assign it to List<Account> if the query is on Account — the runtime does the cast. 
+If the object type isn't known until runtime, keep it as List<sObject>.
+It counts against the same governor limits as static SOQL: same 100-queries-per-transaction cap, same 50,000-row limit. Dynamic vs. static makes no difference to the limits engine.
+If the string is malformed, or references a field/object that doesn't exist, you get a runtime QueryException (or System.QueryException: unexpected token…). 
+This is the compile-time-safety trade-off made concrete: errors that static SOQL would catch at save time now surface in production at execution time.
+
+Working with results generically, when you don't know the type:
+
+apex
+List<sObject> rows = Database.query(q);
+for (sObject row : rows) {
+    Id recId     = (Id) row.get('Id');
+    String name  = (String) row.get('Name');      // generic field access
+    // For parent traversal on generic sObjects:
+    sObject parent = row.getSObject('Account');    // e.g. on a Contact row
+}
+
+get('FieldName') returns Object, so you cast — this is the generic counterpart of contact.Account.Name dot notation.
+
+*************************************************************************************************************************************************************************************************************************
+
+Bind variables in dynamic SOQL
+
+This is the single most important thing to internalize. A bind variable (:varName) in a dynamic query string is not string interpolation. 
+The variable is not pasted into the string. 
+Instead, at execution time, the SOQL engine resolves :varName against the local Apex scope and passes the value through a safe, typed channel — exactly like a prepared statement parameter in JDBC.
+
+apex
+String targetIndustry = 'Technology';
+Decimal minRevenue = 500000;
+
+String q = 'SELECT Id, Name FROM Account ' +
+           'WHERE Industry = :targetIndustry AND AnnualRevenue > :minRevenue';
+
+List<Account> accts = Database.query(q);   // binds resolve here
+
+Why this matters so much:
+
+1.Security. A bound value can never break out of its position and alter the query structure. Even if targetIndustry contained 'Tech\' OR Name != null', 
+it would be treated as a literal string to compare against, not as SOQL syntax. Injection is structurally impossible through a bind.
+2.Correctness. Binds handle typing and escaping for you. Dates, Datetimes, Booleans, Ids, quotes inside strings — all formatted correctly without you thinking about it.
+3.Collections work too. WHERE Id IN :myIdSet binds a whole Set<Id> or List<String>. Try building that as a string yourself and you'll appreciate this.
+
+The classic limitation: the bind must be a variable in scope at the point where Database.query() executes, 
+and it must be a simple variable reference — you can't bind an expression or a method call (:someObj.getValue() fails; assign it to a local first). 
+Historically this also meant helper methods that built query strings couldn't carry their binds with them, which is exactly the problem queryWithBinds solves (below).
+***********************************************************************************************************************************************************************************************************************
+1. Use a bind whenever possible — including for LIKE, by building the pattern in Apex first:
+
+apex
+String pattern = '%' + searchBox + '%';
+String q = 'SELECT Id FROM Contact WHERE LastName LIKE :pattern';
+List<Contact> rows = Database.query(q);
+
+This is fully safe and is almost always achievable for values. Notice the trick: the wildcards go into the Apex variable, not the query string, so the whole thing rides through the bind.
+
+2. If you truly must concatenate a value, escape it:
+
+apex
+String safe = String.escapeSingleQuotes(userInput);
+String q = 'SELECT Id FROM Contact WHERE LastName = \'' + safe + '\'';
+
+escapeSingleQuotes prefixes every ' with \, so the input can't terminate the string literal and inject syntax. Understand its limits, though: it only protects quoted string values. 
+It does nothing for numbers, dates, or booleans concatenated without quotes, and nothing for structural elements.
+
+3. For object/field names (which can never be bound or quoted), validate against the schema:
+
+apex
+String objName = configuredObjectName;   // from user or metadata
+
+// Whitelist approach — does this object actually exist, and is it queryable?
+Schema.SObjectType t = Schema.getGlobalDescribe().get(objName);
+if (t == null || !t.getDescribe().isQueryable()) {
+    throw new IllegalArgumentException('Invalid object: ' + objName);
+}
+
+// Field-level check
+Map<String, Schema.SObjectField> fields = t.getDescribe().fields.getMap();
+if (!fields.containsKey(fieldName)) {
+    throw new IllegalArgumentException('Invalid field: ' + fieldName);
+}
+
+String q = 'SELECT Id, ' + fieldName + ' FROM ' + objName;
+
+Binds can only carry values, never identifiers — you cannot write FROM :objName. So identifiers must be concatenated, and the only safe way to concatenate them is to first prove they're legitimate schema members. 
+An even stricter approach is an explicit allow-list (Set<String> allowed = new Set<String>{'Account','Contact'};).
+
+The mental model: values → bind; can't bind → escape; identifiers → validate against describe/allow-list.
+
+Database.queryWithBinds() — explicit bind maps
+
+Added in API 57.0 (Spring '23), this solves the scope-resolution weakness of classic binds. Instead of the engine hunting for :key in your local variables, you hand it a Map<String, Object>:
+
+apex
+Map<String, Object> binds = new Map<String, Object>{
+    'ind'    => 'Technology',
+    'minRev' => 500000,
+    'ids'    => new Set<Id>{'001...', '001...'}
+};
+
+String q = 'SELECT Id, Name FROM Account ' +
+           'WHERE Industry = :ind AND AnnualRevenue > :minRev AND Id IN :ids';
+
+List<Account> accts = Database.queryWithBinds(q, binds, AccessLevel.USER_MODE);
+
+Why this is a real improvement:
+
+The binds travel with the query. A QueryBuilder helper class can now construct both the string and its bind map and return them together; the caller doesn't need magic local variables with matching names.
+This makes reusable query-building code actually clean.
+Keys are explicit, so there's no accidental capture of some unrelated in-scope variable.
+The third argument, AccessLevel, is required: AccessLevel.SYSTEM_MODE (traditional Apex behavior — object/field permissions ignored) or AccessLevel.USER_MODE (the query respects the running user's object permissions,
+field-level security, and sharing rules). 
+For anything driven by user input, USER_MODE is the modern best practice — it turns "did I remember to check FLS?" into platform-enforced behavior.
+
+Note the map values replace scope resolution entirely — in a queryWithBinds call, :ind looks only in the map, never at local variables.
+
+Database.getQueryLocator() — the Batch Apex variant
+
+Same input (a query string, or even an inline static query), completely different purpose:
+
+apex
+public class MyBatch implements Database.Batchable<sObject> {
+    public Database.QueryLocator start(Database.BatchableContext bc) {
+        String q = 'SELECT Id, Name FROM Account WHERE LastActivityDate < LAST_N_DAYS:365';
+        return Database.getQueryLocator(q);
+    }
+    public void execute(Database.BatchableContext bc, List<Account> scope) { /* ... */ }
+    public void finish(Database.BatchableContext bc) { /* ... */ }
+}
+
+The distinction that matters:
+
+Database.query() materializes results immediately and is subject to the 50,000-row limit.
+Database.getQueryLocator() returns a cursor, not records. In a batch start() method it can drive up to 50 million records, which the platform then feeds to execute() in chunks. 
+It's how you do dynamic SOQL over huge datasets.
+
+Outside Batch Apex, a query locator also powers Database.getQueryLocator(...).iterator() in some streaming scenarios, but batch start() is 95% of its real-world use.
+
+There's also a fourth sibling worth knowing: Database.countQuery() (and countQueryWithBinds()), for dynamic aggregate counts without retrieving rows:
+
+apex
+Integer n = Database.countQuery('SELECT COUNT() FROM Account WHERE Industry = :ind');
+
+A realistic end-to-end example: a filter builder
+
+This is the pattern dynamic SOQL exists for — assembling a query from optional user filters, safely:
+
+apex
+public with sharing class AccountSearchService {
+
+    public static List<Account> search(String nameTerm, String industry, Decimal minRevenue) {
+        List<String> conditions = new List<String>();
+        Map<String, Object> binds = new Map<String, Object>();
+
+        if (String.isNotBlank(nameTerm)) {
+            conditions.add('Name LIKE :namePattern');
+            binds.put('namePattern', '%' + nameTerm + '%');   // wildcard lives in the VALUE
+        }
+        if (String.isNotBlank(industry)) {
+            conditions.add('Industry = :ind');
+            binds.put('ind', industry);
+        }
+        if (minRevenue != null) {
+            conditions.add('AnnualRevenue >= :minRev');
+            binds.put('minRev', minRevenue);
+        }
+
+        String q = 'SELECT Id, Name, Industry, AnnualRevenue FROM Account';
+        if (!conditions.isEmpty()) {
+            q += ' WHERE ' + String.join(conditions, ' AND ');
+        }
+        q += ' ORDER BY Name LIMIT 200';
+
+        return Database.queryWithBinds(q, binds, AccessLevel.USER_MODE);
+    }
+}
+
+Notice what makes this safe and clean: every user-supplied value goes through the bind map (zero concatenation of input), the structural parts of the query are fixed string literals I control, 
+conditions compose via a List<String> + String.join, and USER_MODE enforces FLS/sharing on top. 
+This is the template to reuse whenever you build filterable queries.
+*********************************************************************************************************************************************************************************************************************
+
+Limitations and gotchas checklist
+
+No compile-time validation. A schema change (someone deletes a field) breaks dynamic queries silently until runtime. Mitigate with test coverage that actually executes the query paths.
+Bind expressions must be simple variables in classic Database.query() — no :obj.field, no :method(). Assign to a local first, or use queryWithBinds.
+You can't bind identifiers — object names, field names, ORDER BY directions. Those must be validated/allow-listed and concatenated.
+escapeSingleQuotes only protects quoted string contexts. It is not a general sanitizer.
+Same governor limits as static SOQL — going dynamic buys you zero extra headroom.
+Security modes: old code often relied on WITH SECURITY_ENFORCED inside the query string; the modern replacements are AccessLevel.USER_MODE (on queryWithBinds/query overloads) or Security.stripInaccessible() on the results. Prefer USER_MODE in new code.
+Testing tip: because errors are runtime, write tests for the malformed paths too — assert that invalid field names throw your validation exception rather than leaking a raw QueryException to users.
+
+The one-paragraph summary to file away: dynamic SOQL is a String executed by Database.query() (or queryWithBinds with an explicit bind map and access level, or getQueryLocator for batch-scale). 
+Values always go through binds; anything that can't be bound gets escaped; identifiers get validated against the schema; and USER_MODE handles the permission layer. 
+Reach for it only when the query genuinely can't be known at compile time.
+
+Want to make this stick with a practice exercise — say, extending that AccountSearchService to support dynamic ORDER BY and field selection safely? 
+That forces you through the identifier-validation problem, which is the trickiest part in real code.
+**************************************************************************************************************************************************************************************************************************
+1. Search box concatenated straight into WHERE
+
+The textbook case — a user-controlled search term pasted into the query string.
+
+apex
+// ❌ VULNERABLE
+String term = ApexPages.currentPage().getParameters().get('q');
+String query = 'SELECT Id FROM Contact WHERE LastName = \'' + term + '\'';
+List<Contact> results = Database.query(query);
+
+Input x' OR Name != ' turns the filter into LastName = 'x' OR Name != '' — every contact returned.
+
+apex
+// ✅ FIXED — bind variable, no concatenation
+String term = ApexPages.currentPage().getParameters().get('q');
+String query = 'SELECT Id FROM Contact WHERE LastName = :term';
+List<Contact> results = Database.query(query);
+
+The value now rides through a typed, safe channel and can never alter query structure. Binding is always the first choice.
+*****************************************************************************************************************************
+2. LIKE search with wildcards
+
+People correctly reach for LIKE but then concatenate, thinking the % makes binding impossible.
+
+apex
+// ❌ VULNERABLE
+String term = getUserInput();
+String query = 'SELECT Id FROM Account WHERE Name LIKE \'%' + term + '%\'';
+List<Account> a = Database.query(query);
+apex
+// ✅ FIXED — put the wildcards in the Apex value, then bind
+String term = getUserInput();
+String pattern = '%' + term + '%';        // wildcards live in the variable
+String query = 'SELECT Id FROM Account WHERE Name LIKE :pattern';
+List<Account> a = Database.query(query);
+
+The trick most people miss: build the wildcard pattern in Apex and bind the whole thing. No escaping needed.
+***************************************************************************************************************************
+3. Value that genuinely must be concatenated
+
+Occasionally you're stuck concatenating a string value (some dynamic-clause builders). Then — and only then — escape it.
+
+apex
+// ❌ VULNERABLE
+String status = getStatusFilter();
+String query = 'SELECT Id FROM Case WHERE Status = \'' + status + '\'';
+apex
+// ✅ FIXED — String.escapeSingleQuotes as the fallback
+String status = String.escapeSingleQuotes(getStatusFilter());
+String query = 'SELECT Id FROM Case WHERE Status = \'' + status + '\'';
+
+escapeSingleQuotes backslash-escapes every ', so the input can't terminate the literal. Caveat: it only protects quoted string contexts — it does nothing for the next three scenarios.
+******************************************************************************************************************************************************************************************
+4. Dynamic object or field name (identifiers can't be bound)
+
+Binds carry values, never identifiers. FROM :objName is illegal, so people concatenate — and escaping doesn't help because there are no quotes to escape.
+
+apex
+// ❌ VULNERABLE
+String obj = getConfiguredObject();
+String query = 'SELECT Id, Name FROM ' + obj;   // obj = 'Account WHERE Id != null LIMIT 1 FOR UPDATE' ...
+apex
+// ✅ FIXED — validate against the schema (whitelist by describe)
+String obj = getConfiguredObject();
+Schema.SObjectType t = Schema.getGlobalDescribe().get(obj);
+if (t == null || !t.getDescribe().isQueryable()) {
+    throw new IllegalArgumentException('Invalid object: ' + obj);
+}
+String query = 'SELECT Id, Name FROM ' + String.valueOf(t);
+List<sObject> rows = Database.query(query);
+
+For identifiers the defense is validation, not escaping — prove it's a real, queryable object before it goes in the string. 
+Same pattern for field names via t.getDescribe().fields.getMap().containsKey(fieldName).
+*******************************************************************************************************************************************************************************************
+5. Dynamic ORDER BY
+
+A sortable table where the user picks the column. ORDER BY can't be bound, and this is a favorite injection vector because people forget it's user-controlled.
+
+apex
+// ❌ VULNERABLE
+String sortField = getSortColumn();
+String query = 'SELECT Id, Name FROM Account ORDER BY ' + sortField;
+apex
+// ✅ FIXED — allow-list the permitted columns and direction
+Set<String> allowedFields = new Set<String>{'Name', 'Industry', 'CreatedDate', 'AnnualRevenue'};
+String sortField = getSortColumn();
+String dir = getSortDir() == 'DESC' ? 'DESC' : 'ASC';   // constrain to two values
+
+if (!allowedFields.contains(sortField)) {
+    throw new IllegalArgumentException('Invalid sort field');
+}
+String query = 'SELECT Id, Name FROM Account ORDER BY ' + sortField + ' ' + dir;
+
+An explicit Set allow-list is cleaner and stricter than a describe check when the valid set is known and small.
+******************************************************************************************************************************************************************************************
+6. Numeric / non-string values (escaping does nothing)
+
+A subtle one: escapeSingleQuotes on a number is useless because there are no quotes — the value sits bare in the query.
+
+apex
+// ❌ VULNERABLE — no quotes to escape; escaping this is theater
+String limitParam = getUserLimit();   // '5 OR Name != null'
+String query = 'SELECT Id FROM Account WHERE NumberOfEmployees > ' + limitParam;
+apex
+// ✅ FIXED — bind (best), or type-coerce to prove it's numeric
+Integer safeLimit = Integer.valueOf(getUserLimit());   // throws if not a number
+String query = 'SELECT Id FROM Account WHERE NumberOfEmployees > :safeLimit';
+List<Account> a = Database.query(query);
+
+Either bind it, or force it through Integer.valueOf()/Decimal.valueOf() so a non-numeric payload throws before it can reach the query.
+***********************************************************************************************************************************************************************************
+7. IN-clause built by string-joining a list
+
+Hand-assembling an IN (...) list from user values is a classic footgun — every element is an injection point.
+
+apex
+// ❌ VULNERABLE
+List<String> names = getUserNames();
+String inClause = '(\'' + String.join(names, '\',\'') + '\')';
+String query = 'SELECT Id FROM Contact WHERE LastName IN ' + inClause;
+apex
+// ✅ FIXED — bind the collection directly
+List<String> names = getUserNames();
+String query = 'SELECT Id FROM Contact WHERE LastName IN :names';   // bind the whole List
+List<Contact> c = Database.query(query);
+
+SOQL binds entire List/Set collections into IN clauses natively. Never build the parenthesized list by hand.
+***************************************************************************************************************************************************************************************
+8. Query built in a helper method (the classic bind-scope trap)
+
+Binds resolve against scope at execution — so a query string assembled in one method and executed in another loses its binds, tempting people to concatenate.
+
+apex
+// ❌ VULNERABLE — value concatenated because :term isn't in scope where query runs
+public String buildQuery(String term) {
+    return 'SELECT Id FROM Lead WHERE Company = \'' + term + '\'';
+}
+List<Lead> l = Database.query(buildQuery(userInput));
+apex
+// ✅ FIXED — Database.queryWithBinds carries binds explicitly
+public class QuerySpec { public String soql; public Map<String,Object> binds; }
+
+public QuerySpec buildQuery(String term) {
+    QuerySpec spec = new QuerySpec();
+    spec.soql = 'SELECT Id FROM Lead WHERE Company = :term';
+    spec.binds = new Map<String, Object>{ 'term' => term };
+    return spec;
+}
+QuerySpec spec = buildQuery(userInput);
+List<Lead> l = Database.queryWithBinds(spec.soql, spec.binds, AccessLevel.USER_MODE);
+
+queryWithBinds (API 57.0+) decouples binds from local scope, which removes the very reason people concatenate in builder methods.
+***************************************************************************************************************************************************************************************
+9. Second-order injection (stored value used later)
+
+The value looks trusted because it came from the database — but it was originally user input, stored earlier without sanitization.
+
+apex
+// ❌ VULNERABLE — cfg.Filter_Clause__c was populated from a user form earlier
+Configuration__c cfg = [SELECT Filter_Clause__c FROM Configuration__c LIMIT 1];
+String query = 'SELECT Id FROM Account WHERE ' + cfg.Filter_Clause__c;
+apex
+// ✅ FIXED — treat stored data as untrusted; bind the value, fix the structure
+Configuration__c cfg = [SELECT Filter_Value__c FROM Configuration__c LIMIT 1];
+String val = cfg.Filter_Value__c;
+String query = 'SELECT Id FROM Account WHERE Industry = :val';   // structure is fixed, value bound
+List<Account> a = Database.query(query);
+
+The lesson: "came from the database" is not the same as "safe." Store discrete values (bindable), never raw query fragments. If you must store clause structure, validate it against an allow-list on the way out.
+******************************************************************************************************************************************************************************************************************
+10. Ignoring permissions — the "injection-adjacent" leak
+
+Not classic injection, but the same root cause (untrusted flow reaching data): dynamic queries run in system mode by default, bypassing the user's FLS and sharing. A user can read fields/records they shouldn't.
+
+apex
+// ❌ LEAKY — runs in system mode, ignores FLS + sharing
+String query = 'SELECT Id, Salary__c FROM Employee__c WHERE Name = :name';
+List<Employee__c> emps = Database.query(query);   // exposes Salary__c even if user can't see it
+apex
+// ✅ FIXED — enforce the running user's permissions
+String query = 'SELECT Id, Salary__c FROM Employee__c WHERE Name = :name';
+List<Employee__c> emps = Database.queryWithBinds(
+    query, new Map<String,Object>{'name' => name}, AccessLevel.USER_MODE
+);
+// or on the results:  Security.stripInaccessible(AccessType.READABLE, emps).getRecords();
+
+AccessLevel.USER_MODE makes the platform enforce object permissions, FLS, and sharing — turning a manual "did I check FLS?" into an guarantee. 
+Pair it with the injection defenses above; a query can be injection-proof and still leak data if it runs in system mode.
+***************************************************************************************************************************************************************************************************************
+
+The whole thing collapses into a short decision procedure you can apply to any dynamic query:
+
+Is the untrusted input a…                                    	Defense
+Value (string, number, date, collection)	                    Bind it (:var / queryWithBinds) — always prefer this
+Value you're forced to concatenate	                          String.escapeSingleQuotes() — quoted strings only
+Identifier (object / field name)	                            Validate against Schema describe
+ORDER BY / direction / operator	                              Allow-list the permitted values
+Stored value that was once user input	                        Treat as untrusted → bind or validate
+Any dynamic query touching sensitive data	                    Add AccessLevel.USER_MODE
