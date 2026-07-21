@@ -1,0 +1,126 @@
+SOQL Syntax Basics 
+
+SOQL (Salesforce Object Query Language) looks like SQL but is deliberately narrower — no SELECT *, no arbitrary joins, no UNION. 
+You must name every field explicitly, and you can only traverse relationships that are defined on the objects.
+apexList<Account> accts = [
+    SELECT Id, Name, Industry, AnnualRevenue
+    FROM Account
+    WHERE Industry = 'Technology' AND AnnualRevenue > 1000000
+    ORDER BY Name ASC NULLS LAST
+    LIMIT 100
+];
+The clauses you'll lean on: WHERE with AND/OR/NOT, IN/NOT IN (which pairs beautifully with a Set), LIKE with %/_ wildcards, ORDER BY … ASC|DESC NULLS FIRST|LAST, LIMIT, and OFFSET (capped at 2000). 
+Date literals are a nice touch — you can write WHERE CreatedDate = TODAY or LAST_N_DAYS:30 instead of computing datetimes.
+The killer feature is bind variables: prefix an Apex variable with : inside the query and it's safely interpolated, no string concatenation, no injection risk.
+apexSet<Id> ids = new Set<Id>{'001...', '001...'};
+String targetIndustry = 'Finance';
+List<Account> results = [
+    SELECT Id, Name FROM Account
+    WHERE Id IN :ids AND Industry = :targetIndustry
+];
+
+************************************************************************************************************************************************************************************************************************
+
+Relationship queries
+
+This is the part with no direct SQL analog, and the direction matters a lot.
+Child-to-parent (going "up") — use dot notation, up to 5 levels deep. Each record carries its parent, so a Contact can reach its Account and that Account's Owner:
+apexList<Contact> contacts = [
+    SELECT Id, LastName, Account.Name, Account.Owner.Email
+    FROM Contact
+    WHERE Account.Industry = 'Technology'
+];
+System.debug(contacts[0].Account.Name);          // traverse the loaded parent
+Parent-to-child (going "down") — use a nested subquery, and you reference the child by its relationship name, 
+which is usually the plural (Contacts, Opportunities) for standard objects and MyObject__r for custom ones:
+apexList<Account> accts = [
+    SELECT Id, Name,
+        (SELECT Id, LastName, Email FROM Contacts WHERE Email != null)
+    FROM Account
+];
+for (Account a : accts) {
+    for (Contact c : a.Contacts) {              // nested child list
+        System.debug(a.Name + ' -> ' + c.LastName);
+    }
+}
+The two naming traps: for custom relationships, child-to-parent uses __r (e.g. Invoice__r.Name) while the field itself is __c; and the parent-to-child subquery uses the relationship name, 
+not the object name — for a custom child it's typically Line_Items__r, not Line_Item__c. If a query complains about "didn't understand the relationship," it's almost always this.
+************************************************************************************************************************************************************************************************************************
+
+Aggregate functions
+
+COUNT(), COUNT(field), COUNT_DISTINCT(field), SUM, AVG, MIN, MAX — combined with GROUP BY. 
+The important quirk: aggregate queries return AggregateResult[], not your sObject, and you pull values out with get('alias'), which returns Object (so you cast).
+apexList<AggregateResult> results = [
+    SELECT Industry, COUNT(Id) total, AVG(AnnualRevenue) avgRev
+    FROM Account
+    GROUP BY Industry
+    HAVING COUNT(Id) > 5
+    ORDER BY COUNT(Id) DESC
+];
+
+for (AggregateResult ar : results) {
+    String ind    = (String)  ar.get('Industry');
+    Integer count = (Integer) ar.get('total');       // your alias
+    Decimal avg   = (Decimal) ar.get('avgRev');
+    System.debug(ind + ': ' + count + ' accounts, avg ' + avg);
+}
+Give every aggregated column an alias (COUNT(Id) total) — without one, Salesforce auto-names them expr0, expr1, … and you have to get('expr0'). 
+HAVING filters on the aggregate (post-grouping); WHERE filters rows before grouping. There's also GROUP BY ROLLUP(...) / CUBE(...) for subtotals.
+********************************************************************************************************************************************************************************************************************
+
+SOQL for loops
+
+This is a governor-limit and heap-safety feature, not just syntactic sugar. Two forms:
+apex// Single-record form (rarely what you want)
+for (Account a : [SELECT Id, Name FROM Account WHERE Industry = 'Tech']) {
+    // a is one Account per iteration
+}
+
+// Batched form — processes 200 records per chunk
+for (List<Account> batch : [SELECT Id, Name FROM Account]) {
+    for (Account a : batch) { /* ... */ }
+    // update batch;   // DML on 200 at a time
+}
+The reason this matters: a SOQL for loop streams results in batches of 200 rather than materializing the entire result set in the heap at once. 
+If you queried a million rows into a List<Account>, you'd blow the 6 MB heap limit; the for loop form keeps only 200 in memory per iteration. 
+So for large data volumes, prefer the for loop over assigning to a List variable. (Note it doesn't raise the 50,000-row total query limit — that still applies — it just controls heap.) 
+**********************************************************************************************************************************************************************************************************************
+
+Dynamic SOQL
+
+When the query string isn't known until runtime (user-selected filters, a configurable object name), build it as a String and run it with Database.query():
+apexString objName = 'Account';
+String field   = 'Industry';
+String value   = 'Technology';
+
+String q = 'SELECT Id, Name FROM ' + objName + ' WHERE ' + field + ' = :value';
+List<sObject> rows = Database.query(q);   // bind vars in scope still work!
+Two things to internalize here. First, bind variables still work in dynamic SOQL — :value resolves against your Apex scope — so use them and never concatenate user input directly. 
+Second, when you must concatenate a string into the query (like a LIKE search term), wrap it in String.escapeSingleQuotes() to prevent SOQL injection:
+apexString userInput = getSearchTerm();
+String safe = String.escapeSingleQuotes(userInput);
+String q = 'SELECT Id FROM Contact WHERE LastName LIKE \'%' + safe + '%\'';
+Database.query() returns a single list; Database.getQueryLocator() is the variant you pass to Batch Apex. 
+There's also Database.queryWithBinds() (newer) that takes an explicit bind map instead of relying on scope.
+****************************************************************************************************************************************************************************************************************************
+
+SOSL syntax
+
+SOSL (Salesforce Object Search Language) is for full-text search across multiple objects at once — the thing SOQL can't do. 
+Where SOQL says "give me records matching these field conditions on one object," SOSL says "find this text anywhere across these objects."
+apexList<List<sObject>> searchResults = [
+    FIND 'Acme*' IN NAME FIELDS
+    RETURNING Account(Id, Name), Contact(Id, LastName), Lead(Id, Company)
+];
+
+Account[] foundAccts = (Account[]) searchResults[0];   // order matches RETURNING
+Contact[] foundCons  = (Contact[]) searchResults[1];
+The shape to remember: FIND 'searchterm' (in quotes, supports */? wildcards), an optional IN … FIELDS scope (ALL FIELDS, NAME FIELDS, EMAIL FIELDS, PHONE FIELDS), and RETURNING Object(fields) for each object you care about. 
+It returns a List<List<sObject>> — one inner list per object in your RETURNING clause, in that same order.
+
+When to reach for which: use SOQL when you know the object and are filtering on field values; 
+use SOSL when you're doing a keyword search, especially across several objects, or searching text/long-text fields where SOSL's indexing is far more efficient than a bunch of SOQL LIKE '%...%' scans. 
+In governor terms you get 100 SOQL queries vs. 20 SOSL searches per transaction.
+**********************************************************************************************************************************************************************************************************************************
+
