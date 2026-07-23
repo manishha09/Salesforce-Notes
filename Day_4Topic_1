@@ -1,0 +1,54 @@
+Complete Trigger of Execution 
+
+The full sequence
+
+Pre-save
+
+Load the original record from the database, or initialize it for an upsert.
+Overwrite old field values with the new values from the request. If the request came from a standard UI edit page, run system validation: layout-specific rules, required fields, field formats, max length. This step is skipped for API/Apex-originated saves — that's why a Data Loader insert can bypass layout-level required fields.
+Execute before-save record-triggered flows. These run before your before triggers. Newer than most trigger docs and a common surprise.
+Execute all before triggers.
+Run most system validation again, plus all custom validation rules (validation rules, required-field checks, field formats). The only thing not re-run is layout-specific enforcement.
+Execute duplicate rules. If a rule blocks, the save stops here — no after triggers, no workflow.
+Save to the database — not committed.
+
+Post-save, pre-commit
+
+Execute all after triggers.
+Execute assignment rules (Lead, Case).
+Execute auto-response rules (Lead, Case).
+Execute workflow rules.
+If workflow had field updates, update the record again.
+If step 12 fired, re-run before update and after update triggers one more time — exactly once — plus standard validations. Custom validation rules, duplicate rules, and escalation rules do not re-run.
+Execute processes and flows launched from workflow rules as immediate actions. If these update the record, before/after update triggers fire again.
+Execute escalation rules (Case).
+Execute after-save record-triggered flows. If they update the record, triggers fire again.
+Execute entitlement rules.
+If the record has a roll-up summary field or is part of a cross-object workflow, recalculate and update the parent — and the parent runs its own full save procedure.
+Same for the grandparent if the parent update cascades.
+Execute criteria-based sharing recalculation.
+Commit all DML.
+
+Post-commit
+
+Execute post-commit logic: outbound email, @future methods, Queueable jobs, Batch Apex enqueued during the transaction, and the async paths of record-triggered flows.
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+The parts that actually bite
+
+Steps 12–13 — the double fire. A workflow field update re-runs your update triggers. If your handler isn't idempotent or lacks a recursion guard, you get duplicate child records or double-counted roll-ups. This is the #1 reason for static-boolean guards.
+
+Step 18 — parent save procedure. Roll-up summary updates put the parent through the entire order of execution, including its own triggers. A trigger on Opportunity Line Item can silently cascade into Opportunity triggers, then Account triggers, all inside one transaction sharing one set of governor limits.
+
+Steps 2 vs 5 — why formula fields look stale. Formula fields aren't stored; they're computed on read. In a before trigger, reading a formula that depends on a field you just changed in the same trigger gives you the old value. If you need the recomputed value you have to be in after, or requery.
+
+Step 3 — before-save flows beat your trigger. If a flow and a trigger both default the same field, the flow wins the first write and your trigger overwrites it. Worth checking when a value mysteriously isn't what the admin configured.
+
+Steps 7 vs 21 — uncommitted is still visible. Between 7 and 21, SOQL inside the transaction sees the saved values, but nothing is durable. An uncaught exception anywhere through step 20 rolls the whole thing back. This is precisely why callouts are forbidden mid-transaction and why side effects belong in step 22 via Queueable or @future.
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+One caveat on your framing
+
+Workflow Rules and Process Builder are both retired for new creation — you can't build new ones, and Salesforce has been migrating existing ones to Flow. They still occupy their steps in the order of execution for legacy automation, so you need to know them for the certification and for maintaining older orgs, but for anything new the relevant steps are 3 (before-save flow) and 16 (after-save flow).
+
+Practical consequence: before-save flows are faster than before triggers for simple field updates — no Apex execution, no separate save. The modern guidance is flow for declarative field updates, Apex triggers for anything requiring complex logic, bulk queries, or callouts.
+
+Given where you are, the recursion guard pattern is the direct follow-on here — steps 12–16 are the reason it exists.
