@@ -1,0 +1,159 @@
+The order, compressed
+#	Step	                                                                   Notes
+1	Load original record / initialize for upsert	
+2	Overwrite fields with request values; system validation                	UI edits only — API/Apex skips layout-level checks
+3	Before-save record-triggered flows	                                    before your triggers
+4	Before triggers	
+5	System validation again + all custom validation rules	
+6	Duplicate rules	                                                        blocks here → nothing downstream runs
+7	Save to DB — uncommitted	                                              Ids now exist
+8	After triggers	
+9–10	Assignment rules → auto-response rules	                            Lead/Case
+11	Workflow rules	
+12–13	Workflow field update → re-fire before/after 
+update triggers once	                                                    ← recursion source
+14	Processes/flows from workflow (immediate actions)	
+updates re-fire triggers
+15	Escalation rules	Case
+16	After-save record-triggered flows	updates re-fire triggers
+17	Entitlement rules	
+18	Roll-up summary / cross-object workflow → parent runs its own
+full save procedure	                                                      ← recursion source
+19	Grandparent, same	
+20	Criteria-based sharing recalculation	
+21	Commit	
+22	Post-commit: outbound email, @future, Queueable, Batch, async flow paths
+
+***************************************************************************************************************************************************************************************************************
+
+Where flows run
+
+Flows appear at four distinct points, and conflating them causes real confusion:
+
+Before-save record-triggered flow → step 3. Runs before your before triggers, in the same save transaction, no separate DML. This is the fastest automation Salesforce offers for simple same-record field updates — roughly 10× faster than a workflow field update because there's no second save. Consequence: if a flow and a trigger both set the same field, the flow writes first and the trigger overwrites it.
+
+After-save record-triggered flow → step 16. Runs after escalation rules. Can create/update related records, send emails, call Apex. Any DML it performs kicks off a fresh order of execution on the target object.
+
+Processes and flows launched from workflow rules → step 14. Legacy path. Immediate actions only.
+
+Scheduled and async paths of record-triggered flows → step 22 / later. Scheduled paths run after commit at their configured time, in a separate transaction with fresh governor limits. Async paths (used for callouts) run post-commit. Neither is inside your transaction, so neither can roll it back.
+
+Screen flows are not in this list at all — they're user-driven UI, not DML-triggered. But each DML the screen flow executes runs the full order of execution for that object.
+
+*******************************************************************************************************************************************************************************************************************************************************************************************************************
+Where validation rules fire
+
+Step 5 — after before triggers, before the save. Two implications that matter:
+
+Before triggers can fix or break validation. If a before trigger populates a required field, the validation rule at step 5 sees the populated value and passes. Conversely, a before trigger blanking a field will trip a validation rule the user never touched, and the error message will confuse them.
+
+They do not re-run after workflow field updates. Step 13 re-fires update triggers but explicitly skips custom validation rules, duplicate rules, and escalation rules. So a workflow field update can write a value that violates a validation rule and it goes through. Same for the roll-up path — actually no, step 18 is the opposite case and worth calling out separately below.
+
+Apex addError() is effectively validation at step 4 — one step earlier than declarative rules. If both would fire, the user sees your Apex message first because the save aborts before step 5.
+
+Validation rules run on API/Apex DML. Only the layout-specific system validation at step 2 is skipped for non-UI saves. Custom validation rules always apply — which is why a bulk data load can fail on rules the admin forgot about.
+
+The roll-up trap at step 18: when a child update recalculates a parent roll-up, the parent runs its entire save procedure including its own validation rules. If the new roll-up value violates a validation rule on the parent, the parent's save fails, and because it's all one transaction, the child's save fails too. Users get an error about a record they didn't edit.
+*************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************
+Recursive triggers
+Where recursion comes from
+DML in an after trigger targeting the same object
+Workflow field updates (steps 12–13)
+Process Builder / flow updates (steps 14, 16)
+Roll-up summary parent updates (step 18) cascading into the parent's triggers
+Cross-object ping-pong: Account trigger updates Contacts, Contact trigger updates Account
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+What Salesforce does about it
+
+There's a hard ceiling: System.LimitException: Maximum trigger depth exceeded at 16 levels of nesting. This is uncatchable and rolls back the entire transaction.
+
+But hitting depth 16 is the lucky outcome. The common failure is subtler — you don't recurse infinitely, you recurse two or three times, and each pass creates a duplicate Task, or increments a counter, or re-queries. No exception, just wrong data. Plus every pass consumes from the same shared governor budget: 100 SOQL, 150 DML, 10s CPU for the whole transaction regardless of depth.
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+The static boolean — and why it's usually wrong
+apex
+public class TriggerGuard {
+    public static Boolean hasRun = false;
+}
+apex
+trigger AccountTrigger on Account (after update) {
+    if (TriggerGuard.hasRun) return;
+    TriggerGuard.hasRun = true;
+    AccountTriggerHandler.doWork(Trigger.new, Trigger.oldMap);
+}
+
+Statics live for the duration of the execution context, so this does stop re-entry. It also has a serious bug:
+
+DML on more than 200 records fires the trigger in chunks of 200. Update 500 Accounts and the trigger runs three times as separate legitimate invocations. The first chunk sets hasRun = true; chunks 2 and 3 silently skip. You process 200 records and drop 300. This bug survives every test that inserts fewer than 201 records — which is most tests.
+
+(Related trap for Batch Apex: statics reset between each execute() call. Database.Stateful preserves instance variables, not statics. So a guard behaves differently in batch than in a single transaction.)
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Better: track which records you've processed
+
+public class TriggerGuard {
+    private static Set<Id> processedIds = new Set<Id>();
+
+    public static Set<Id> getUnprocessed(Set<Id> candidateIds) {
+        Set<Id> fresh = new Set<Id>(candidateIds);
+        fresh.removeAll(processedIds);
+        processedIds.addAll(fresh);
+        return fresh;
+    }
+}
+
+public static void doWork(List<Account> newAccts, Map<Id, Account> oldMap) {
+
+    Set<Id> toProcess = TriggerGuard.getUnprocessed(oldMap.keySet());
+    if (toProcess.isEmpty()) return;
+
+    for (Account a : newAccts) {
+        if (!toProcess.contains(a.Id)) continue;
+        // ...
+    }
+}
+
+Record-scoped rather than transaction-scoped, so chunk 2 of a 500-record update proceeds normally while genuine re-entry on the same record is blocked.
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Best: make the logic idempotent
+
+Guards are a patch. The robust answer is logic that's safe to run twice because it checks whether the thing it cares about actually changed:
+
+public static void syncContactsOnRename(List<Account> newAccts, Map<Id, Account> oldMap) {
+
+    Set<Id> renamedIds = new Set<Id>();
+
+    for (Account a : newAccts) {
+        // the guard IS the change check
+        if (a.Name != oldMap.get(a.Id).Name) {
+            renamedIds.add(a.Id);
+        }
+    }
+
+    if (renamedIds.isEmpty()) return;   // second pass exits here naturally
+    // ...
+}
+
+public static void syncContactsOnRename(List<Account> newAccts, Map<Id, Account> oldMap) {
+
+    Set<Id> renamedIds = new Set<Id>();
+
+    for (Account a : newAccts) {
+        // the guard IS the change check
+        if (a.Name != oldMap.get(a.Id).Name) {
+            renamedIds.add(a.Id);
+        }
+    }
+
+    if (renamedIds.isEmpty()) return;   // second pass exits here naturally
+    // ...
+}
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Practical checklist
+* Recursion protection lives in the handler, not the trigger — it should be testable independently
+* If you must use a static flag, reset it appropriately or use the Set<Id> variant; never a bare boolean on an object that gets bulk-loaded
+* If you're calling update in an after update trigger on the same object, first ask whether that logic belongs in before update — that usually removes the recursion entirely
+* Test with 201+ records specifically to catch the chunking bug
+
+Natural next stops from here: the trigger handler framework (fflib or a lightweight base class), @TestSetup and bulk test patterns, and asynchronous Apex — Queueable vs @future vs Batch — which is where step 22 gets interesting.
+
