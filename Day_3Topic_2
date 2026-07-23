@@ -1,0 +1,66 @@
+When to use before vs after
+
+The decision rule in one line: before if you're changing the record being saved; after if you're reacting to it.
+
+before
+
+Setting or defaulting field values on Trigger.new — free write, no DML, no recursion
+Validation that must block the save (addError())
+Normalizing data (trimming, uppercasing, deriving a field from other fields)
+before delete to prevent deletion
+
+after
+
+You need the Id (mandatory in the insert case — it doesn't exist yet in before insert)
+Creating or updating related records (children, junction objects, parent roll-ups)
+Reading system-populated values: formula fields, auto-number, LastModifiedDate, roll-up summaries
+Anything asynchronous or external: @future, Queueable, Platform Events, callouts
+Creating share records (AccountShare etc.) — needs the Id
+
+The trap that catches people: they write logic in after update to set a field on the same record, then need an explicit update DML, which re-fires the trigger, which needs a recursion guard. Nine times out of ten that logic belonged in before update where a bare assignment would have done it.
+***********************************************************************************************************************************************************************************************************************************************
+Trigger.newMap
+
+Map<Id, sObject> — the same records as Trigger.new, keyed by record Id. It exists purely for O(1) lookup.
+
+Its real job is pairing with Trigger.oldMap for change detection:
+
+apex
+for (Contact c : Trigger.new) {
+    Contact old = Trigger.oldMap.get(c.Id);   // O(1)
+    if (c.Email != old.Email) { ... }
+}
+
+Without the map you'd nest loops over Trigger.new and Trigger.old — 200 × 200 iterations and a CPU-limit risk. The lists are positionally aligned, so Trigger.old[i] corresponds to Trigger.new[i], but relying on index alignment is fragile and nobody reviews it favorably.
+
+Two things to internalize:
+
+Null in before insert — no Ids exist, so no keys. Also null in every delete context (there's only oldMap) and populated in after undelete.
+Read-only reference semantics. Trigger.newMap.get(id) in a before context returns a pointer to the same object as in Trigger.new, so mutating through it works — but newMap isn't available in before insert anyway, so just modify Trigger.new directly and don't think about it.
+
+It's also the fastest way to get the affected Ids: Trigger.newMap.keySet() hands you a Set<Id> ready to drop into a SOQL IN clause.
+
+************************************************************************************************************************************************************************************************************************************************************
+Can you do DML in a before trigger?
+
+Yes — the platform allows it. The distinction is which records:
+
+Don't do DML on Trigger.new records. In before insert they have no Id and aren't in the database, so insert Trigger.new throws. In before update an update Trigger.new re-enters the save pipeline mid-save and you get recursion or a System.DmlException. Just assign to the field directly:
+
+apex
+// wrong
+for (Account a : Trigger.new) { a.Rating = 'Hot'; }
+update Trigger.new;   // ❌
+
+// right
+for (Account a : Trigger.new) { a.Rating = 'Hot'; }   // ✅ platform persists it
+
+You can do DML on other records — inserting a Task, updating a related Account, creating a log row. It's legal and it works.
+
+But it's usually still the wrong call, for reasons you'll recognize from transactional systems:
+
+The current record hasn't committed yet. If it fails validation after your before trigger runs, the whole transaction rolls back, including your side-effect DML. Fine for consistency, but it means you burned DML statements and CPU on work that got thrown away.
+Related-record work often needs the parent Id, which doesn't exist yet on insert.
+You're consuming from the 150-DML / 10,000-row budget earlier in the transaction than necessary.
+
+So the practical rule: side effects go in after, field mutations go in before. The one common exception is a before trigger doing a SOQL query — reading related data to compute a field value is completely normal and is the reason before triggers still need bulkification.
