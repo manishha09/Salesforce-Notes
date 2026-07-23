@@ -1,0 +1,175 @@
+Three triggers on three different objects (keeping the one-trigger-per-object rule intact), each with a thin trigger file and the logic in a handler.
+
+1. before insert — default values
+apex
+trigger AccountTrigger on Account (before insert) {
+    AccountTriggerHandler.applyDefaults(Trigger.new);
+}
+apex
+public with sharing class AccountTriggerHandler {
+
+    public static void applyDefaults(List<Account> newAccounts) {
+
+        // Hierarchy custom setting — no SOQL, no governor cost
+        AccountDefaults__c defaults = AccountDefaults__c.getInstance();
+        String fallbackRating = (defaults != null && String.isNotBlank(defaults.Rating__c))
+            ? defaults.Rating__c
+            : 'Warm';
+
+        for (Account acc : newAccounts) {
+
+            if (String.isBlank(acc.Rating))       acc.Rating = fallbackRating;
+            if (String.isBlank(acc.Type))         acc.Type = 'Prospect';
+            if (acc.AnnualRevenue == null)        acc.AnnualRevenue = 0;
+            if (String.isBlank(acc.BillingCountry)) acc.BillingCountry = 'India';
+
+            // normalization belongs here too
+            if (String.isNotBlank(acc.Name)) acc.Name = acc.Name.trim();
+        }
+    }
+}
+
+Note what's absent: no update statement. Assigning to Trigger.new in a before context is persisted by the save pipeline for free. Also note String.isBlank() rather than == null — it catches empty strings and whitespace, which is what you actually want for text fields coming from an integration or a data load.
+
+
+***************************************************************************************************************************************************************************************************************************************************************************************************************************************
+
+2. after insert — create child records
+apex
+trigger OpportunityTrigger on Opportunity (after insert) {
+    OpportunityTriggerHandler.createKickoffTasks(Trigger.new);
+}
+
+
+public with sharing class OpportunityTriggerHandler {
+
+    private static final Set<String> KICKOFF_STAGES =
+        new Set<String>{ 'Prospecting', 'Qualification' };
+
+    public static void createKickoffTasks(List<Opportunity> newOpps) {
+
+        List<Task> toInsert = new List<Task>();
+
+        for (Opportunity opp : newOpps) {
+
+            if (!KICKOFF_STAGES.contains(opp.StageName)) continue;
+
+            toInsert.add(new Task(
+                WhatId       = opp.Id,          // ← the reason this is `after`
+                OwnerId      = opp.OwnerId,
+                Subject      = 'Kickoff call: ' + opp.Name,
+                ActivityDate = Date.today().addDays(3),
+                Priority     = 'High',
+                Status       = 'Not Started'
+            ));
+        }
+
+        if (toInsert.isEmpty()) return;
+
+        // allOrNone = false: one bad child doesn't roll back all 200 parents
+        List<Database.SaveResult> results = Database.insert(toInsert, false);
+
+        for (Integer i = 0; i < results.size(); i++) {
+            if (!results[i].isSuccess()) {
+                System.debug(LoggingLevel.ERROR,
+                    'Kickoff task failed for ' + toInsert[i].WhatId + ': ' +
+                    results[i].getErrors()[0].getMessage());
+            }
+        }
+    }
+}
+
+Three things worth flagging:
+
+One insert for the whole batch. Collect into a list, DML once outside the loop. insert inside the for loop is the single most common trigger bug and it dies at 151 records.
+Database.insert(list, false) vs plain insert. Plain insert is all-or-nothing — one failure throws and rolls back the entire transaction including the Opportunities. Partial-success mode lets the good ones through and hands you SaveResult objects to inspect. Choose deliberately; for side-effect records like activity logs, partial success is almost always right.
+WhatId needs the Id, which is exactly why this can't be a before insert.
+
+********************************************************************************************************************************************************************************************************************************************************************************************************************************************************************
+
+3. before update — validation
+apex
+trigger CaseTrigger on Case (before update) {
+    CaseTriggerHandler.validateClosure(Trigger.new, Trigger.oldMap);
+}
+
+public with sharing class CaseTriggerHandler {
+
+    public static void validateClosure(List<Case> newCases, Map<Id, Case> oldMap) {
+
+        // Phase 1: find records that are *transitioning* into Closed
+        Set<Id> closingIds = new Set<Id>();
+
+        for (Case c : newCases) {
+            Case oldCase = oldMap.get(c.Id);
+            if (c.Status == 'Closed' && oldCase.Status != 'Closed') {
+                closingIds.add(c.Id);
+            }
+        }
+
+        if (closingIds.isEmpty()) return;   // cheap exit — most saves won't qualify
+
+        // Phase 2: one aggregate query for all of them
+        Map<Id, Integer> openTasksByCase = new Map<Id, Integer>();
+        for (AggregateResult ar : [
+            SELECT WhatId wid, COUNT(Id) cnt
+            FROM Task
+            WHERE WhatId IN :closingIds
+              AND IsClosed = false
+            GROUP BY WhatId
+        ]) {
+            openTasksByCase.put((Id) ar.get('wid'), (Integer) ar.get('cnt'));
+        }
+
+        // Phase 3: apply errors
+        for (Case c : newCases) {
+
+            if (!closingIds.contains(c.Id)) continue;
+
+            if (String.isBlank(c.Description)) {
+                c.Description.addError('A resolution summary is required before closing.');
+            }
+
+            if (String.isBlank(c.Reason)) {
+                c.Reason.addError('Select a case reason before closing.');
+            }
+
+            Integer openCount = openTasksByCase.get(c.Id);
+            if (openCount != null && openCount > 0) {
+                c.addError('Cannot close: ' + openCount + ' open task(s) remain.');
+            }
+        }
+    }
+}
+
+The collect → query → apply shape is the standard bulkified structure, and it's the same instinct as batching an N+1 into a single IN query. Note the early return — skipping the SOQL entirely when nothing qualifies matters when the trigger fires on every save.
+
+On addError specifically:
+
+record.addError(msg) → error banner at the top of the page. record.Field.addError(msg) → error rendered inline next to that field, but only if the field is on the page layout; otherwise the user sees nothing and just wonders why the save failed. Prefer record-level when you're unsure.
+It doesn't throw. Execution continues, so you can accumulate errors across several fields and several records in one pass — which is why you can flag record 7 and record 12 independently in the same batch.
+The message is HTML-escaped by default. addError(msg, false) disables escaping if you need markup, which also means you own the injection risk — same reasoning as the dynamic SOQL escaping you covered earlier.
+In a bulk DML, a single addError on one record fails only that record when the caller used Database.update(list, false); with plain update the whole batch rolls back.
+
+
+
+******************************************************************************************************************************************************************************************************************
+
+Consolidating
+
+If all three patterns lived on one object, you'd have a single trigger routing by context rather than three files:
+
+apex
+trigger AccountTrigger on Account (before insert, after insert, before update) {
+
+    switch on Trigger.operationType {
+        when BEFORE_INSERT { AccountTriggerHandler.applyDefaults(Trigger.new); }
+        when AFTER_INSERT  { AccountTriggerHandler.createChildren(Trigger.new); }
+        when BEFORE_UPDATE { AccountTriggerHandler.validate(Trigger.new, Trigger.oldMap); }
+    }
+}
+
+Trigger.operationType with switch on is cleaner than nested isBefore/isInsert booleans, and the compiler catches typos in the enum values.
+
+For test coverage, each of these needs at least a bulk test (201 records, proving no governor blowup), a positive case, and — for the validation one — a negative case wrapping the DML in try/catch and asserting on DmlException.getDmlMessage(0). That's probably the natural next stop in the series, along with the recursion guard pattern.
+
