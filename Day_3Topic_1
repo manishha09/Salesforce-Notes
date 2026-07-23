@@ -1,0 +1,97 @@
+What a trigger is
+
+Apex code that fires automatically when a DML operation happens on an sObject. Conceptually it's a database hook — closest analogue in your world is a Postgres trigger or a Mongoose pre/post middleware, except it always runs in bulk (Salesforce processes records in batches of up to 200 per invocation).
+
+apex
+trigger AccountTrigger on Account (before insert, before update, after insert, after update) {
+    // routing logic here
+}
+
+One trigger per object is the near-universal convention — multiple triggers on the same object have nondeterministic execution order.
+
+
+Trigger events
+
+Event	                                    Fires
+before insert	                            after validation rules pass, before record written to DB
+after insert	                            after commit to DB (still in same transaction), record has an Id
+before update	                            before the update is written
+after update	                            after the update is written
+before delete	                            before removal
+after delete	                            after removal
+after undelete	                            when a record is restored from the Recycle Bin
+
+There is no before undelete. Delete events only give you the old state; insert events only give you the new state.
+
+
+
+Context variables
+
+Four you'll use constantly, plus the boolean flags on Trigger:
+
+Trigger.new — List<sObject> of the new versions. Writable in before contexts only.
+Trigger.old — List<sObject> of the versions as they existed prior. Always read-only.
+Trigger.newMap — Map<Id, sObject> keyed by record Id.
+Trigger.oldMap — Map<Id, sObject> keyed by record Id.
+
+Plus Trigger.isBefore, isAfter, isInsert, isUpdate, isDelete, isUndelete, Trigger.size, and Trigger.operationType (an enum — cleaner than chaining booleans).
+
+
+Availability matrix
+Event	        new	                     newMap	             old	             oldMap
+before insert	✅ (writable)	          ❌	              ❌	              ❌
+after insert	✅ (read-only)	          ✅	              ❌	              ❌
+before update	✅ (writable)	          ❌	              ✅	              ✅
+after update	✅	                      ✅	              ✅	              ✅
+before delete	❌	                      ❌	              ✅	              ✅
+after delete	❌	                      ❌	              ✅	              ✅
+after undelete	✅	                      ✅	              ❌	              ❌
+
+
+The one that trips people up: Trigger.newMap is null in before insert — records don't have Ids yet, so there's no key to map on.
+
+The old/new pairing is what makes field-change detection possible:
+
+apex
+for (Opportunity opp : Trigger.new) {
+    Opportunity oldOpp = Trigger.oldMap.get(opp.Id);
+    if (opp.StageName != oldOpp.StageName && opp.StageName == 'Closed Won') {
+        // stage transitioned
+    }
+}
+
+before vs after
+
+Use before when you're modifying fields on the records being saved. Assign directly to Trigger.new and the platform persists it as part of the same save — no DML, no extra governor limit consumption, no recursion risk.
+
+apex
+// before insert/update
+for (Account a : Trigger.new) {
+    a.Name = a.Name.toUpperCase();  // just assign — no update() call
+}
+
+Also use before for cross-record validation you want to block the save (addError() on the record), and for before delete to prevent deletion.
+
+Use after when you need something that only exists post-commit:
+
+The record Id (mandatory for before insert — you don't have one yet). Creating child records, junction records, sharing rules.
+Roll-up calculations onto parent records.
+Firing Platform Events, @future calls, Queueables.
+Fields the system populates on save (formula fields, auto-numbers, LastModifiedDate).
+
+Never call update() on Trigger.new inside a before trigger — it's already in the save pipeline, you'll get a recursion error or wasted DML. And in after contexts Trigger.new is read-only; modifying a record in after update requires an explicit update DML against a fresh copy, which re-fires the trigger. That's where the static-boolean recursion guard pattern comes in.
+
+The patterns that matter for you
+
+Bulkify everything. Triggers receive up to 200 records. No SOQL or DML inside a for loop, ever — collect Ids into a Set, query once outside the loop, build a Map, iterate. Same instinct as avoiding N+1 in your Mongo/Postgres work, but here it's a hard limit (100 SOQL, 150 DML per transaction) that throws an uncatchable LimitException.
+
+Handler pattern. Keep the trigger file as a thin router; put logic in a separate handler class. Testable, and it keeps the one-trigger-per-object rule from producing a 900-line file.
+
+apex
+trigger AccountTrigger on Account (before insert, before update, after insert, after update) {
+    AccountTriggerHandler.run();  // or new AccountTriggerHandler().run() with a framework base class
+}
+
+Order of execution. Triggers are one step in a long chain: system validation → before triggers → system validation again → save to DB (not committed) → after triggers → assignment/auto-response/workflow rules → processes and flows → escalation rules → roll-up summaries recalculated → commit. Worth memorizing the full list; a lot of "why did my field revert" bugs live in there.
+
+Given where you are in the series, the natural next topics are the trigger handler framework, recursion control with static variables, and addError() for validation.
