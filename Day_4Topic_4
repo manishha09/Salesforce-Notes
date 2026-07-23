@@ -1,0 +1,314 @@
+Setup: three custom fields + one validation rule
+
+On Account:
+
+Field	Type	Purpose
+Flow_Stamp__c	Text(255)	written by the before-save flow
+Trigger_Stamp__c	Text(255)	appended by each before-trigger pass
+After_Flow_Stamp__c	Text(255)	written by the after-save flow
+
+Validation rule Trace_Rating_Guard:
+
+AND( ISPICKVAL(Rating, 'Hot'), ISBLANK(Description) )
+
+Error message: Hot accounts need a Description. — deliberately easy to trip so you can watch where the save aborts.
+
+******************************************************************************************************************************************************************************************
+
+The trace helper
+
+Everything logs at LoggingLevel.ERROR so the lines survive even if you drop Apex Code to ERROR level, and they're trivially greppable.
+
+public class ExecTrace {
+
+    private static Integer seq = 0;
+    public  static Integer saveDepth = 0;
+
+    public static void mark(String context, Integer rows) {
+        seq++;
+        System.debug(LoggingLevel.ERROR, String.format(
+            '### [{0}] {1} | depth={2} | rows={3} | SOQL={4}/{5} DML={6}/{7} CPU={8}ms',
+            new List<String>{
+                String.valueOf(seq),
+                context,
+                String.valueOf(saveDepth),
+                String.valueOf(rows),
+                String.valueOf(Limits.getQueries()),
+                String.valueOf(Limits.getLimitQueries()),
+                String.valueOf(Limits.getDmlStatements()),
+                String.valueOf(Limits.getLimitDmlStatements()),
+                String.valueOf(Limits.getCpuTime())
+            }
+        ));
+    }
+
+    public static void note(String msg) {
+        System.debug(LoggingLevel.ERROR, '###     ' + msg);
+    }
+}
+
+The limit counters are the important part — they make visible that recursion shares one budget.
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+The trigger
+apex
+trigger AccountTrigger on Account (
+    before insert, before update, before delete,
+    after  insert, after  update, after  delete, after undelete
+) {
+    Boolean isSaveEntry = Trigger.isBefore && (Trigger.isInsert || Trigger.isUpdate);
+    Boolean isSaveExit  = Trigger.isAfter  && (Trigger.isInsert || Trigger.isUpdate);
+
+    if (isSaveEntry) ExecTrace.saveDepth++;
+
+    ExecTrace.mark(String.valueOf(Trigger.operationType), Trigger.size);
+
+    AccountTriggerHandler.route();
+
+    if (isSaveExit) ExecTrace.saveDepth--;
+}
+
+saveDepth is a manual counter — Salesforce exposes no Trigger.depth. Increment on the before-context (first thing in a save), decrement on the after-context (last thing). Delete contexts are left alone.
+
+The handler
+
+public with sharing class AccountTriggerHandler {
+
+    public static void route() {
+        switch on Trigger.operationType {
+            when BEFORE_INSERT { stamp(Trigger.new, 'BI'); }
+            when BEFORE_UPDATE { stamp(Trigger.new, 'BU'); }
+            when AFTER_INSERT  { observe(Trigger.new); }
+            when AFTER_UPDATE  { observe(Trigger.new); }
+            when else          { ExecTrace.note('no-op context'); }
+        }
+    }
+
+    private static void stamp(List<Account> accts, String tag) {
+        for (Account a : accts) {
+            // ← the proof: can the trigger already see the flow's write?
+            ExecTrace.note('Flow_Stamp__c as seen by ' + tag + ' = ' + a.Flow_Stamp__c);
+
+            a.Trigger_Stamp__c = (String.isBlank(a.Trigger_Stamp__c) ? '' : a.Trigger_Stamp__c + ' > ')
+                               + tag + '@d' + ExecTrace.saveDepth;
+        }
+    }
+
+    private static void observe(List<Account> accts) {
+        for (Account a : accts) {
+            ExecTrace.note('Id=' + a.Id
+                         + ' | Flow=' + a.Flow_Stamp__c
+                         + ' | Trigger=' + a.Trigger_Stamp__c
+                         + ' | AfterFlow=' + a.After_Flow_Stamp__c);
+        }
+    }
+}
+
+That note() inside stamp() is the single most instructive line in the whole setup. If Flow_Stamp__c is already populated when the before trigger reads it, you've directly observed step 3 running before step 4.
+
+*********************************************************************************************************************************************************************************************************************************
+
+Flow 1 — before-save (step 3)
+
+Click path: Setup → Flows → New → Record-Triggered Flow → Account → A record is created or updated → Fast Field Updates (before save) → Assignment element → $Record.Flow_Stamp__c = BEFORE-SAVE-FLOW.
+
+Metadata if you'd rather deploy it:
+
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>61.0</apiVersion>
+    <assignments>
+        <name>Stamp_Before</name>
+        <label>Stamp Before</label>
+        <locationX>176</locationX><locationY>287</locationY>
+        <assignmentItems>
+            <assignToReference>$Record.Flow_Stamp__c</assignToReference>
+            <operator>Assign</operator>
+            <value><stringValue>BEFORE-SAVE-FLOW</stringValue></value>
+        </assignmentItems>
+    </assignments>
+    <interviewLabel>Trace Before Save {!$Flow.CurrentDateTime}</interviewLabel>
+    <label>Trace - Before Save</label>
+    <processType>AutoLaunchedFlow</processType>
+    <start>
+        <locationX>50</locationX><locationY>0</locationY>
+        <connector><targetReference>Stamp_Before</targetReference></connector>
+        <object>Account</object>
+        <recordTriggerType>CreateAndUpdate</recordTriggerType>
+        <triggerType>RecordBeforeSave</triggerType>
+    </start>
+    <status>Active</status>
+</Flow>
+
+Flow 2 — after-save (step 16), deliberately recursive
+
+Actions and Related Records (after save), entry condition After_Flow_Stamp__c is null, containing an Update Records element on $Record setting After_Flow_Stamp__c = 'AFTER-SAVE-FLOW'.
+
+That entry condition is what stops it at depth 2 instead of running to the depth-16 exception. Remove it temporarily if you want to watch the ceiling get hit — it's worth doing once
+
+<start>
+        <object>Account</object>
+        <recordTriggerType>CreateAndUpdate</recordTriggerType>
+        <triggerType>RecordAfterSave</triggerType>
+        <filterLogic>and</filterLogic>
+        <filters>
+            <field>After_Flow_Stamp__c</field>
+            <operator>IsNull</operator>
+            <value><booleanValue>true</booleanValue></value>
+        </filters>
+        <connector><targetReference>Update_Self</targetReference></connector>
+    </start>
+
+*******************************************************************************************************************************************************************************************************************************
+Debug log configuration
+
+Setup → Debug Logs → New Trace Flag on your user. The default SFDC_DevConsole debug level won't show flow internals — create a custom one:
+
+Category	Level	What it unlocks
+Apex Code	FINEST	USER_DEBUG, CODE_UNIT_STARTED/FINISHED
+Workflow	FINER	all FLOW_* entries — this is the one people miss
+Validation	INFO	VALIDATION_RULE, VALIDATION_PASS/FAIL
+Database	INFO	DML_BEGIN/END, SOQL_EXECUTE_*
+Apex Profiling	FINE	CUMULATIVE_LIMIT_USAGE block
+System	DEBUG	
+
+Flow logging lives under Workflow, not a category called "Flow". At INFO you get interview start/end only; FINER gives you element-by-element; FINEST adds every value assignment.
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Experiment 1 — plain insert
+apex
+// exp1.apex
+Account a = new Account(Name = 'Trace Test 1', Rating = 'Warm');
+insert a;
+
+System.debug(LoggingLevel.ERROR, '### FINAL: ' +
+    [SELECT Flow_Stamp__c, Trigger_Stamp__c, After_Flow_Stamp__c
+     FROM Account WHERE Id = :a.Id]);
+bash
+sf apex run --file exp1.apex --target-org myorg
+sf apex get log --number 1 --target-org myorg > run.log
+
+Annotated result (indentation mine, to show nesting):
+
+EXECUTION_STARTED
+CODE_UNIT_STARTED|[EXTERNAL]|execute_anonymous_apex
+ DML_BEGIN|[2]|Op:Insert|Type:Account|Rows:1
+                                                        ← step 3
+   FLOW_START_INTERVIEWS_BEGIN|1
+   FLOW_START_INTERVIEW_BEGIN|Trace - Before Save
+     FLOW_ELEMENT_BEGIN|FlowAssignment|Stamp_Before
+     FLOW_VALUE_ASSIGNMENT|...|$Record.Flow_Stamp__c|BEFORE-SAVE-FLOW
+     FLOW_ELEMENT_END|FlowAssignment|Stamp_Before
+   FLOW_START_INTERVIEW_END|Trace - Before Save
+   FLOW_START_INTERVIEWS_END|1
+                                                        ← step 4
+   CODE_UNIT_STARTED|01q...|AccountTrigger on Account trigger event BeforeInsert for [new]
+     USER_DEBUG|[..]|ERROR|### [1] BEFORE_INSERT | depth=1 | rows=1 | SOQL=0/100 DML=0/150 CPU=3ms
+     USER_DEBUG|[..]|ERROR|###     Flow_Stamp__c as seen by BI = BEFORE-SAVE-FLOW   ← PROOF
+   CODE_UNIT_FINISHED|AccountTrigger ... BeforeInsert
+                                                        ← step 5
+   VALIDATION_RULE|03d...|Trace_Rating_Guard
+   VALIDATION_FORMULA|AND(ISPICKVAL(Rating,"Hot"), ISBLANK(Description))
+   VALIDATION_PASS
+                                                        ← step 7 (implicit, no marker)
+                                                        ← step 8
+   CODE_UNIT_STARTED|01q...|AccountTrigger on Account trigger event AfterInsert for [001...]
+     USER_DEBUG|[..]|ERROR|### [2] AFTER_INSERT | depth=1 | rows=1 | SOQL=0/100 DML=1/150 CPU=9ms
+     USER_DEBUG|[..]|ERROR|###     Id=001... | Flow=BEFORE-SAVE-FLOW | Trigger=BI@d1 | AfterFlow=null
+   CODE_UNIT_FINISHED|AccountTrigger ... AfterInsert
+                                                        ← step 16
+   FLOW_START_INTERVIEWS_BEGIN|1
+   FLOW_START_INTERVIEW_BEGIN|Trace - After Save
+     FLOW_ELEMENT_BEGIN|FlowRecordUpdate|Update_Self
+      DML_BEGIN|Op:Update|Type:Account|Rows:1                    ← recursion begins
+        CODE_UNIT_STARTED|...trigger event BeforeUpdate for [001...]
+          USER_DEBUG|### [3] BEFORE_UPDATE | depth=2 | rows=1 | SOQL=0/100 DML=1/150 CPU=14ms
+        CODE_UNIT_FINISHED
+        VALIDATION_RULE|03d...|Trace_Rating_Guard
+        VALIDATION_PASS
+        CODE_UNIT_STARTED|...trigger event AfterUpdate for [001...]
+          USER_DEBUG|### [4] AFTER_UPDATE | depth=2 | rows=1 | SOQL=0/100 DML=2/150 CPU=19ms
+          USER_DEBUG|###     Id=001... | Trigger=BI@d1 > BU@d2 | AfterFlow=AFTER-SAVE-FLOW
+        CODE_UNIT_FINISHED
+      DML_END
+     FLOW_ELEMENT_END|FlowRecordUpdate|Update_Self
+   FLOW_START_INTERVIEW_END|Trace - After Save
+   FLOW_START_INTERVIEWS_END|1
+ DML_END|[2]
+ SOQL_EXECUTE_BEGIN|[5]|SELECT Flow_Stamp__c, ...
+ USER_DEBUG|### FINAL: Account:{Flow_Stamp__c=BEFORE-SAVE-FLOW, Trigger_Stamp__c=BI@d1 > BU@d2, ...}
+CUMULATIVE_LIMIT_USAGE
+  Number of SOQL queries: 1 out of 100
+  Number of DML statements: 2 out of 150
+EXECUTION_FINISHED
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Experiment 2 — trip the validation rule
+apex
+Account a = new Account(Name = 'Trace Test 2', Rating = 'Hot');  // no Description
+try { insert a; } catch (DmlException e) {
+    System.debug(LoggingLevel.ERROR, '### CAUGHT: ' + e.getDmlMessage(0));
+}
+FLOW_START_INTERVIEW_BEGIN|Trace - Before Save          ← ran
+CODE_UNIT_STARTED|...BeforeInsert                       ← ran
+CODE_UNIT_FINISHED
+VALIDATION_RULE|03d...|Trace_Rating_Guard
+VALIDATION_FAIL                                          ← stops here
+DML_END
+USER_DEBUG|### CAUGHT: Hot accounts need a Description.
+
+No AfterInsert. No after-save flow. Everything from step 6 onward is skipped. This is the visual answer to "why didn't my after trigger fire" — and it's also why work you put in a before trigger can be thrown away.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Experiment 3 — the chunking bug
+apex
+List<Account> accts = new List<Account>();
+for (Integer i = 0; i < 450; i++) {
+    accts.add(new Account(Name = 'Bulk ' + i, Rating = 'Warm'));
+}
+insert accts;
+### [1] BEFORE_INSERT | depth=1 | rows=200
+### [2] AFTER_INSERT  | depth=1 | rows=200
+### [3] BEFORE_INSERT | depth=1 | rows=200
+### [4] AFTER_INSERT  | depth=1 | rows=200
+### [5] BEFORE_INSERT | depth=1 | rows=50
+### [6] AFTER_INSERT  | depth=1 | rows=50
+
+Three invocations, depth=1 every time. This is the log that kills the naive static-boolean guard: a bare hasRun flag would set on invocation 1 and silently skip 250 records, and depth never rises because these aren't recursion — they're legitimate chunks.
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Reading logs efficiently
+bash
+sf apex tail log --color                       # live stream while you click in the UI
+
+grep -E 'CODE_UNIT_STARTED|FLOW_START_INTERVIEW_BEGIN|VALIDATION_(RULE|PASS|FAIL)|USER_DEBUG.*###|DML_(BEGIN|END)|WF_' run.log
+
+grep '###' run.log                             # just your trace lines
+
+Marker reference:
+
+Marker	Step	Reads as
+CODE_UNIT_STARTED|...trigger event X for [new]	4	before-insert (no Ids yet)
+CODE_UNIT_STARTED|...trigger event X for [001...]	8	after-context (Ids present)
+FLOW_START_INTERVIEWS_BEGIN above first code unit	3	before-save flow
+FLOW_START_INTERVIEWS_BEGIN below after-trigger	16	after-save flow
+VALIDATION_RULE / PASS / FAIL	5	custom validation
+WF_RULE_EVAL_BEGIN / WF_FIELD_UPDATE	11–12	legacy workflow
+DML_BEGIN nested inside DML_BEGIN	—	recursion
+FLOW_INTERVIEW_FINISHED with no DML	—	flow ran but changed nothing
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Gotchas that will waste your afternoon
+
+Logs truncate silently. Any single log over 20 MB gets trimmed from the middle — you keep the head and tail and lose exactly the nesting you were trying to read. Drop Database and System to NONE when you only care about flow/trigger ordering, and test with 1–2 records rather than 450.
+
+FINEST changes behavior. Log level FINEST on Apex Code adds real overhead and can push you over the 10-second CPU limit on transactions that pass fine at DEBUG. If a bulk operation only fails when you're logging, that's the cause.
+
+System.debug always executes. Setting Apex Code to NONE suppresses the output, not the string concatenation. Heavy debug statements in a loop still burn CPU in production.
+
+Only 24 hours of trace flag. Trace flags expire; re-enable before each session. And logs are capped at 1000 per user / 250 MB org-wide — after that new logs stop being generated until you delete old ones. If your log mysteriously doesn't appear, that's usually why.
+
+Order among multiple flows on one object is not guaranteed unless you set Flow Trigger Order (the triggerOrder field, 1–2000) on each. Without it, two before-save flows on Account run in an undefined sequence — same hazard as multiple triggers per object.
+
+Once you've watched experiment 3, the Set<Id>-based recursion guard from earlier stops being an abstract preference and becomes obvious. Good next step: instrument the guard itself with ExecTrace.note() so you can see it skip on the recursive pass but not on chunks 2 and 3.
