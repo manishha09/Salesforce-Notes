@@ -1,0 +1,120 @@
+Bulkification
+
+What: Writing Apex so a single invocation correctly handles a collection of records rather than one. Triggers receive up to 200 records per invocation; a bulkified trigger processes all 200 with a fixed number of queries and DML statements regardless of batch size.
+
+Why it matters: Salesforce is multi-tenant, so governor limits are hard per-transaction ceilings — 100 SOQL, 150 DML statements, 50,000 rows retrieved, 10s CPU, 6 MB heap. Exceeding them throws System.LimitException, which is uncatchable and rolls back the entire transaction. Non-bulkified code works perfectly for a single record from a UI edit and dies the first time someone runs a Data Loader import or a Flow does a mass update. That's a production bug that never appeared in testing.
+
+The shape: collect → query once → map → iterate.
+
+apex
+// collect keys
+Set<Id> accountIds = new Set<Id>();
+for (Opportunity o : opps) {
+    if (o.AccountId != null) accountIds.add(o.AccountId);
+}
+if (accountIds.isEmpty()) return;
+
+// one query
+Map<Id, Account> accounts = new Map<Id, Account>([
+    SELECT Id, AnnualRevenue FROM Account WHERE Id IN :accountIds
+]);
+
+// O(1) lookups, DML collected outside the loop
+List<Task> toInsert = new List<Task>();
+for (Opportunity o : opps) {
+    Account a = accounts.get(o.AccountId);
+    if (a != null && a.AnnualRevenue > 10000000) {
+        toInsert.add(new Task(WhatId = o.Id, Subject = 'Enterprise review'));
+    }
+}
+if (!toInsert.isEmpty()) insert toInsert;
+
+The trap most people miss: it isn't only about loops. Nested loops over two collections blow the CPU limit without a single query inside them. And a Map isn't optional decoration — it's what turns an O(n²) scan into O(n).
+
+************************************************************************************************************************************************************************************************************************************************
+
+Recursive trigger prevention
+
+Where recursion comes from: DML in an after trigger on the same object; workflow field updates re-firing update triggers; flows updating the record they were triggered by; roll-up summaries putting the parent through its own full save procedure; two objects' triggers updating each other.
+
+The ceiling: Maximum trigger depth exceeded at 16 levels — uncatchable, full rollback. But that's the lucky failure. The common one is recursing twice, creating a duplicate child record or double-incrementing a counter, with no exception at all.
+
+Three approaches, in order of preference:
+
+1. Move it to before. If you're setting a field on the record being saved, do it in before with a bare assignment. No DML, no recursion, problem eliminated. This solves the majority of cases.
+
+2. Make the logic idempotent. Gate on an actual field change:
+
+apex
+Set<Id> renamed = new Set<Id>();
+for (Account a : Trigger.new) {
+    if (a.Name != Trigger.oldMap.get(a.Id).Name) renamed.add(a.Id);
+}
+if (renamed.isEmpty()) return;   // recursive pass exits here naturally
+
+On the second pass Trigger.old holds what the first pass wrote, so nothing looks changed and the set comes back empty. No static state to manage.
+
+3. A static guard, when you genuinely need cross-invocation state. Statics live for the execution context, which is the right scope — but scope it to records, not to a boolean:
+
+apex
+public class RecursionGuard {
+    private static Map<String, Set<Id>> processed = new Map<String, Set<Id>>();
+
+    public static Set<Id> claim(String key, Set<Id> candidates) {
+        if (!processed.containsKey(key)) processed.put(key, new Set<Id>());
+        Set<Id> seen = processed.get(key);
+        Set<Id> fresh = new Set<Id>(candidates);
+        fresh.removeAll(seen);
+        seen.addAll(fresh);
+        return fresh;
+    }
+}
+
+The trap: public static Boolean hasRun = false is the answer everyone gives and it's broken. DML over 200 records fires the trigger in chunks of 200 — separate, legitimate invocations. Chunk 1 sets the flag; chunks 2 and 3 silently skip. Update 450 records, process 200, drop 250. Passes every test that inserts fewer than 201 records. Saying this in an interview is what distinguishes you from someone who read a blog post.
+
+Also worth knowing: statics reset between each Batch Apex execute() call, so a guard behaves differently in batch than in a single transaction.
+
+**************************************************************************************************************************************************************************************************************************************************************
+
+Trigger handler pattern
+
+What: Keep the trigger file as a two-line dispatcher and put all logic in Apex classes.
+
+apex
+trigger AccountTrigger on Account (before insert, before update, after insert, after update) {
+    new AccountTriggerHandler().run();
+}
+
+Why:
+
+One trigger per object is mandatory because execution order across multiple triggers on the same object is undefined. A handler makes that constraint livable instead of producing a 900-line file.
+Testability. Trigger bodies can't be unit tested in isolation — you need DML to invoke them. Service methods taking plain List<sObject> can be called directly with in-memory records, no database round trip.
+Recursion control has somewhere to live. A guard in a trigger body isn't testable; in a class it is.
+Bypass capability. Data migrations and test setup need to skip automation.
+
+The layering that matters:
+
+AccountTrigger.trigger     dispatch only
+  └─ AccountTriggerHandler routes by Trigger.operationType, holds the casts
+       └─ AccountService   static methods, plain collections, business logic
+
+The handler knows about trigger context; the service doesn't. That split is the whole point — it's what makes the logic callable from a Queueable, a Flow-invocable method, or a test without any of them pretending to be a trigger.
+
+Base class dispatch:
+
+apex
+public void run() {
+    if (isBypassed(handlerName)) return;
+    switch on Trigger.operationType {
+        when BEFORE_INSERT { this.beforeInsert(); }
+        when BEFORE_UPDATE { this.beforeUpdate(); }
+        when AFTER_INSERT  { this.afterInsert();  }
+        // ...
+    }
+}
+
+with protected virtual no-op methods the concrete handler overrides selectively.
+
+The trap: register all seven events in the trigger file even if unused. Adding an event later means editing the trigger, which means a deployment touching a trigger; registering upfront means you only ever touch Apex classes.
+
+If you're prepping these as interview answers, the follow-up questions you should expect are: "how would you test that?" (201+ records to prove chunking safety), "what's the order of execution?" (you've got that), and "when would you use a flow instead of a trigger?" — before-save flows are roughly 10× faster for simple same-record field updates, so the modern split is declarative field updates in flow, complex logic and callouts in Apex.
