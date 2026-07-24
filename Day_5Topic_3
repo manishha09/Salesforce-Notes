@@ -1,0 +1,460 @@
+Target architecture
+force-app/main/default/
+├── triggers/
+│   ├── AccountTrigger.trigger          2 lines
+│   ├── OpportunityTrigger.trigger      2 lines
+│   └── CaseTrigger.trigger             2 lines
+└── classes/
+    ├── TriggerHandler.cls              base — dispatch + bypass
+    ├── RecursionGuard.cls              Set<Id> per logical operation
+    ├── AccountTriggerHandler.cls       context routing only
+    ├── AccountService.cls              logic, plain collections
+    ├── OpportunityTriggerHandler.cls
+    ├── OpportunityService.cls
+    ├── CaseTriggerHandler.cls
+    ├── CaseService.cls
+    └── TriggerBulkTest.cls
+
+The rule that drives every file: handlers know about Trigger; services don't. A service method takes List<Account> and Map<Id, Account> and has no idea whether it was called from a trigger, a Queueable, or a test.
+
+Foundation
+public virtual class TriggerHandler {
+
+    private static Set<String> bypassed = new Set<String>();
+
+    public static void bypass(String name)      { bypassed.add(name); }
+    public static void clearAllBypasses()       { bypassed.clear(); }
+    public static Boolean isBypassed(String n)  { return bypassed.contains(n); }
+
+    @TestVisible private Boolean isExecuting;
+    @TestVisible private TriggerOperation context;
+
+    public TriggerHandler() {
+        this.isExecuting = Trigger.isExecuting;
+        this.context     = Trigger.operationType;
+    }
+
+    public void run() {
+        if (!isExecuting) {
+            throw new TriggerHandlerException('run() called outside trigger context');
+        }
+        if (isBypassed(String.valueOf(this).substringBefore(':'))) return;
+
+        switch on this.context {
+            when BEFORE_INSERT  { beforeInsert();  }
+            when BEFORE_UPDATE  { beforeUpdate();  }
+            when BEFORE_DELETE  { beforeDelete();  }
+            when AFTER_INSERT   { afterInsert();   }
+            when AFTER_UPDATE   { afterUpdate();   }
+            when AFTER_DELETE   { afterDelete();   }
+            when AFTER_UNDELETE { afterUndelete(); }
+        }
+    }
+
+    protected virtual void beforeInsert()  {}
+    protected virtual void beforeUpdate()  {}
+    protected virtual void beforeDelete()  {}
+    protected virtual void afterInsert()   {}
+    protected virtual void afterUpdate()   {}
+    protected virtual void afterDelete()   {}
+    protected virtual void afterUndelete() {}
+
+    public class TriggerHandlerException extends Exception {}
+}
+
+public class RecursionGuard {
+
+    private static Map<String, Set<Id>> processed = new Map<String, Set<Id>>();
+
+    public static Set<Id> claim(String key, Set<Id> candidates) {
+        if (!processed.containsKey(key)) processed.put(key, new Set<Id>());
+        Set<Id> seen  = processed.get(key);
+        Set<Id> fresh = new Set<Id>(candidates);
+        fresh.removeAll(seen);
+        seen.addAll(fresh);
+        return fresh;
+    }
+
+    @TestVisible static void reset() { processed.clear(); }
+}
+
+*****************************************************************************************************************************************************************************************************************
+
+Refactor 1 — Account defaults
+
+trigger AccountTrigger on Account (
+    before insert, before update, before delete,
+    after insert, after update, after delete, after undelete
+) {
+    new AccountTriggerHandler().run();
+}
+apex
+public with sharing class AccountTriggerHandler extends TriggerHandler {
+
+    private List<Account>    newList = (List<Account>) Trigger.new;
+    private Map<Id, Account> oldMap  = (Map<Id, Account>) Trigger.oldMap;
+
+    protected override void beforeInsert() {
+        AccountService.applyDefaults(newList);
+    }
+
+    protected override void beforeUpdate() {
+        AccountService.applyDefaults(newList);
+    }
+}
+
+public with sharing class AccountService {
+
+    private static final String DEFAULT_COUNTRY = 'India';
+
+    public static void applyDefaults(List<Account> accts) {
+
+        AccountDefaults__c cfg = AccountDefaults__c.getInstance();
+        String fallbackRating = (cfg != null && String.isNotBlank(cfg.Rating__c))
+            ? cfg.Rating__c : 'Warm';
+
+        for (Account a : accts) {
+            if (String.isBlank(a.Rating))          a.Rating = fallbackRating;
+            if (String.isBlank(a.Type))            a.Type = 'Prospect';
+            if (a.AnnualRevenue == null)           a.AnnualRevenue = 0;
+            if (String.isBlank(a.BillingCountry))  a.BillingCountry = DEFAULT_COUNTRY;
+            if (String.isNotBlank(a.Name))         a.Name = a.Name.trim();
+        }
+    }
+}
+
+What the refactor bought: applyDefaults is now callable in a test with new List<Account>{ new Account(Name = ' x ') } — no DML, no governor cost, runs in milliseconds. That was impossible when the same code lived behind Trigger.new.
+
+****************************************************************************************************************************************************************************************************************************************************
+
+Refactor 2 — Opportunity, the bulkified showcase
+
+This is the one that has to survive 200 records. It does two things at once — insert child Tasks and roll a sum up to the parent Account — which is where non-bulkified code usually dies.
+
+apex
+trigger OpportunityTrigger on Opportunity (
+    before insert, before update, before delete,
+    after insert, after update, after delete, after undelete
+) {
+    new OpportunityTriggerHandler().run();
+}
+
+public with sharing class OpportunityTriggerHandler extends TriggerHandler {
+
+    private List<Opportunity>    newList = (List<Opportunity>) Trigger.new;
+    private List<Opportunity>    oldList = (List<Opportunity>) Trigger.old;
+    private Map<Id, Opportunity> oldMap  = (Map<Id, Opportunity>) Trigger.oldMap;
+
+    protected override void afterInsert() {
+        OpportunityService.createKickoffTasks(newList);
+        OpportunityService.rollupToAccounts(accountIds(newList, null));
+    }
+
+    protected override void afterUpdate() {
+        OpportunityService.createKickoffTasks(changedToKickoffStage());
+        OpportunityService.rollupToAccounts(accountIds(newList, oldList));
+    }
+
+    protected override void afterDelete() {
+        OpportunityService.rollupToAccounts(accountIds(null, oldList));
+    }
+
+    protected override void afterUndelete() {
+        OpportunityService.rollupToAccounts(accountIds(newList, null));
+    }
+
+    /** Union of parent Ids across both versions — catches reparenting. */
+    private Set<Id> accountIds(List<Opportunity> a, List<Opportunity> b) {
+        Set<Id> ids = new Set<Id>();
+        if (a != null) for (Opportunity o : a) if (o.AccountId != null) ids.add(o.AccountId);
+        if (b != null) for (Opportunity o : b) if (o.AccountId != null) ids.add(o.AccountId);
+        return ids;
+    }
+
+    private List<Opportunity> changedToKickoffStage() {
+        List<Opportunity> result = new List<Opportunity>();
+        for (Opportunity o : newList) {
+            if (o.StageName != oldMap.get(o.Id).StageName) result.add(o);
+        }
+        return result;
+    }
+}
+
+accountIds taking both lists is the detail people skip: if an Opportunity moves from Account A to Account B, both parents need recalculating. Only collecting from Trigger.new leaves A permanently wrong.
+
+public with sharing class OpportunityService {
+
+    private static final Set<String> KICKOFF_STAGES =
+        new Set<String>{ 'Prospecting', 'Qualification' };
+
+    @TestVisible static Integer lastQueryCount;   // instrumentation for bulk tests
+    @TestVisible static Integer lastDmlCount;
+
+    // ------------------------------------------------------------------
+    public static void createKickoffTasks(List<Opportunity> opps) {
+
+        if (opps == null || opps.isEmpty()) return;
+
+        List<Task> toInsert = new List<Task>();
+
+        for (Opportunity o : opps) {                       // no SOQL, no DML in here
+            if (!KICKOFF_STAGES.contains(o.StageName)) continue;
+            toInsert.add(new Task(
+                WhatId       = o.Id,
+                OwnerId      = o.OwnerId,
+                Subject      = 'Kickoff call: ' + o.Name,
+                ActivityDate = Date.today().addDays(3),
+                Priority     = 'High',
+                Status       = 'Not Started'
+            ));
+        }
+
+        if (toInsert.isEmpty()) return;
+
+        for (Database.SaveResult sr : Database.insert(toInsert, false)) {
+            if (!sr.isSuccess()) {
+                System.debug(LoggingLevel.ERROR, 'Task failed: ' + sr.getErrors()[0].getMessage());
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    public static void rollupToAccounts(Set<Id> accountIds) {
+
+        if (accountIds == null || accountIds.isEmpty()) return;
+
+        Set<Id> toProcess = RecursionGuard.claim('OpportunityService.rollup', accountIds);
+        if (toProcess.isEmpty()) return;
+
+        Integer q0 = Limits.getQueries();
+        Integer d0 = Limits.getDmlStatements();
+
+        // ---- ONE aggregate query for every parent ----
+        Map<Id, Decimal> wonTotals = new Map<Id, Decimal>();
+        Map<Id, Integer> openCount = new Map<Id, Integer>();
+
+        for (AggregateResult ar : [
+            SELECT AccountId aid, StageName stage, SUM(Amount) amt, COUNT(Id) cnt
+            FROM Opportunity
+            WHERE AccountId IN :toProcess
+            GROUP BY AccountId, StageName
+        ]) {
+            Id aid      = (Id) ar.get('aid');
+            String st   = (String) ar.get('stage');
+            Decimal amt = (Decimal) ar.get('amt');
+            Integer cnt = (Integer) ar.get('cnt');
+
+            if (st == 'Closed Won') {
+                wonTotals.put(aid, (wonTotals.containsKey(aid) ? wonTotals.get(aid) : 0) + amt);
+            } else if (st != 'Closed Lost') {
+                openCount.put(aid, (openCount.containsKey(aid) ? openCount.get(aid) : 0) + cnt);
+            }
+        }
+
+        // ---- ONE query for the parents ----
+        List<Account> toUpdate = new List<Account>();
+
+        for (Account a : [
+            SELECT Id, Won_Revenue__c, Open_Opp_Count__c
+            FROM Account WHERE Id IN :toProcess
+        ]) {
+            Decimal won  = wonTotals.containsKey(a.Id) ? wonTotals.get(a.Id) : 0;
+            Integer open = openCount.containsKey(a.Id) ? openCount.get(a.Id) : 0;
+
+            // ---- only DML records that actually changed ----
+            if (a.Won_Revenue__c != won || a.Open_Opp_Count__c != open) {
+                a.Won_Revenue__c    = won;
+                a.Open_Opp_Count__c = open;
+                toUpdate.add(a);
+            }
+        }
+
+        if (!toUpdate.isEmpty()) update toUpdate;
+
+        lastQueryCount = Limits.getQueries() - q0;
+        lastDmlCount   = Limits.getDmlStatements() - d0;
+    }
+}
+
+Cost profile: 2 SOQL + at most 2 DML, whether the trigger got 1 record or 200. The GROUP BY AccountId, StageName collapses what would otherwise be a per-account query into one. The change-comparison before adding to toUpdate is doing double duty — it saves DML rows and it's the reason the Account trigger doesn't get re-entered pointlessly.
+
+Refactor 3 — Case validation
+apex
+trigger CaseTrigger on Case (
+    before insert, before update, before delete,
+    after insert, after update, after delete, after undelete
+) {
+    new CaseTriggerHandler().run();
+}
+apex
+public with sharing class CaseTriggerHandler extends TriggerHandler {
+    protected override void beforeUpdate() {
+        CaseService.validateClosure(
+            (List<Case>) Trigger.new,
+            (Map<Id, Case>) Trigger.oldMap
+        );
+    }
+}
+
+public with sharing class CaseService {
+
+    public static void validateClosure(List<Case> cases, Map<Id, Case> oldMap) {
+
+        // PHASE 1 — collect only records transitioning into Closed
+        Set<Id> closing = new Set<Id>();
+        for (Case c : cases) {
+            if (c.Status == 'Closed' && oldMap.get(c.Id).Status != 'Closed') {
+                closing.add(c.Id);
+            }
+        }
+        if (closing.isEmpty()) return;              // exits before spending any SOQL
+
+        // PHASE 2 — one aggregate query
+        Map<Id, Integer> openTasks = new Map<Id, Integer>();
+        for (AggregateResult ar : [
+            SELECT WhatId wid, COUNT(Id) cnt
+            FROM Task
+            WHERE WhatId IN :closing AND IsClosed = false
+            GROUP BY WhatId
+        ]) {
+            openTasks.put((Id) ar.get('wid'), (Integer) ar.get('cnt'));
+        }
+
+        // PHASE 3 — apply errors
+        for (Case c : cases) {
+            if (!closing.contains(c.Id)) continue;
+
+            if (String.isBlank(c.Description)) {
+                c.addError('A resolution summary is required before closing.');
+            }
+            Integer open = openTasks.get(c.Id);
+            if (open != null && open > 0) {
+                c.addError('Cannot close: ' + open + ' open task(s) remain.');
+            }
+        }
+    }
+}
+
+The early return matters more than it looks. This trigger fires on every Case save in the org; without it you'd burn a SOQL query on saves that have nothing to do with closure.
+************************************************************************************************************************************************************************************************************************
+The bulk test
+
+201 is the magic number — it forces the platform into two chunks and exposes the static-boolean bug that 200 records hides.
+
+@IsTest
+private class TriggerBulkTest {
+
+    private static final Integer BULK = 201;
+
+    @TestSetup
+    static void setup() {
+        List<Account> accts = new List<Account>();
+        for (Integer i = 0; i < 50; i++) {
+            accts.add(new Account(Name = 'Bulk Acct ' + i));
+        }
+        insert accts;
+    }
+
+    @IsTest
+    static void insert201Opportunities_staysWithinLimits() {
+
+        List<Account> accts = [SELECT Id FROM Account];
+        List<Opportunity> opps = new List<Opportunity>();
+
+        for (Integer i = 0; i < BULK; i++) {
+            opps.add(new Opportunity(
+                Name      = 'Bulk Opp ' + i,
+                StageName = 'Prospecting',
+                CloseDate = Date.today().addDays(30),
+                Amount    = 1000,
+                AccountId = accts[Math.mod(i, accts.size())].Id
+            ));
+        }
+
+        Test.startTest();
+        insert opps;                                  // ← 2 chunks: 200 + 1
+        Test.stopTest();
+
+        // every record processed — this is what a naive static boolean breaks
+        Assert.areEqual(BULK, [SELECT COUNT() FROM Task WHERE Subject LIKE 'Kickoff call:%'],
+            'All 201 records must produce a Task, not just the first chunk of 200');
+
+        // the service's own footprint, captured via @TestVisible statics
+        Assert.isTrue(OpportunityService.lastQueryCount <= 2,
+            'Rollup must stay at 2 SOQL regardless of volume');
+    }
+
+    @IsTest
+    static void bulkUpdate_rollupIsCorrect() {
+
+        Account a = new Account(Name = 'Rollup Target');
+        insert a;
+
+        List<Opportunity> opps = new List<Opportunity>();
+        for (Integer i = 0; i < BULK; i++) {
+            opps.add(new Opportunity(
+                Name = 'Rollup ' + i, StageName = 'Prospecting',
+                CloseDate = Date.today().addDays(10), Amount = 100, AccountId = a.Id
+            ));
+        }
+        insert opps;
+
+        for (Opportunity o : opps) o.StageName = 'Closed Won';
+
+        Test.startTest();
+        update opps;
+        Test.stopTest();
+
+        Account result = [SELECT Won_Revenue__c, Open_Opp_Count__c FROM Account WHERE Id = :a.Id];
+        Assert.areEqual(BULK * 100, result.Won_Revenue__c, 'Sum must include all 201 chunks');
+        Assert.areEqual(0, result.Open_Opp_Count__c);
+    }
+
+    @IsTest
+    static void validationBlocksClosureWithOpenTasks() {
+
+        Case c = new Case(Subject = 'Test', Status = 'New');
+        insert c;
+        insert new Task(WhatId = c.Id, Subject = 'Open item', Status = 'Not Started');
+
+        c.Status = 'Closed';
+        c.Description = 'Resolved';
+
+        Test.startTest();
+        try {
+            update c;
+            Assert.fail('Expected DmlException');
+        } catch (DmlException e) {
+            Assert.isTrue(e.getDmlMessage(0).contains('open task'), e.getDmlMessage(0));
+        }
+        Test.stopTest();
+    }
+
+    @IsTest
+    static void defaultsApplyWithoutDml() {
+        // service tested directly — no database, runs in ~5ms
+        List<Account> accts = new List<Account>{ new Account(Name = '  Padded  ') };
+        AccountService.applyDefaults(accts);
+
+        Assert.areEqual('Padded', accts[0].Name);
+        Assert.areEqual('Prospect', accts[0].Type);
+        Assert.areEqual('India', accts[0].BillingCountry);
+    }
+}
+
+Two things about that first assertion. Assert.areEqual(BULK, ...) on the Task count is the only assertion that catches the chunking bug — a hasRun boolean would produce 200 Tasks and pass any test using 200 records. And the @TestVisible static Integer lastQueryCount trick is how you assert on the trigger's internal limit consumption; Limits.getQueries() in the test method itself measures the test context, not the trigger's, which is why people usually can't prove bulk safety and just hope.
+
+The last test is the payoff for the handler/service split — no DML, no @TestSetup, no trigger. Pure function call. In a mature org that's where most of your coverage should live, with a handful of DML-based tests proving the wiring.
+
+What changed, summarized
+	                                                                               Before	                                                    After
+Trigger body	                                          routing logic, isBefore/isInsert chains	                                           2 lines
+Logic location	                                       static methods on a "handler" that took Trigger.new	                               service methods taking plain collections
+Testability	                                           required DML to invoke anything	                                                   services callable in-memory
+Recursion	                                             none, or a bare boolean	                                                           Set<Id> guard + change-detection
+Rollup cost	                                           scaled with record count	                                                           fixed 2 SOQL / 2 DML
+Bypass	                                               impossible	                                                                         TriggerHandler.bypass('X')
+Reparenting	                                           parent A left stale	                                                               union of old + new parent Ids
+
+The natural continuation from here is async — the kickoff-task creation is a reasonable candidate for a Queueable once you're chaining more work, and that's where Test.startTest/stopTest stops being boilerplate and starts being load-bearing.
+
