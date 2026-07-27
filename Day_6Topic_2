@@ -1,0 +1,120 @@
+What happens when you exceed a limit
+
+A System.LimitException is thrown — and this is the exception that behaves unlike every other one in Apex.
+
+It's uncatchable in the normal sense. You can write catch (Exception e) or even catch (System.LimitException e) around the offending code, but it won't save the transaction. The platform lets you into the catch block for logging, then still rolls everything back and surfaces the error to the user. You cannot swallow it and continue. This is deliberate — governor limits protect the multi-tenant substrate, so Salesforce doesn't let one tenant's code opt out.
+
+apex
+try {
+    for (Integer i = 0; i < 200; i++) {
+        insert new Account(Name = 'x' + i);   // dies at statement 151
+    }
+} catch (Exception e) {
+    System.debug(e.getMessage());  // runs — but the transaction is already doomed
+}
+// everything above rolls back regardless
+
+Full rollback. Every DML operation in the transaction is reversed — not just the one that tripped the limit. Records already "saved" (steps 7–20 of the order of execution, pre-commit) are undone. Since nothing committed, the database is left as if the transaction never ran.
+
+The error the user sees depends on entry point: a red banner on a UI edit page, a row-level error in Data Loader, an HTTP 4xx/5xx with the LimitException in the API response, a failed row in a Bulk API job. In every case the message names the limit — Too many SOQL queries: 101, Apex CPU time limit exceeded, Apex heap size too large.
+
+One important asymmetry: the statement that crosses the line fails, and the count is inclusive. Too many SOQL queries: 101 means query 101 was the fatal one — you got 100 through. CPU and heap are checked continuously, so those fail mid-operation at the moment you cross, not at a clean boundary.
+
+Emails are the exception to rollback. Messaging.sendEmail that already fired is not recalled by the rollback — the email is gone. Same for anything that left the transaction: a callout that completed, a Platform Event published with publishImmediately. This is a real bug source: a transaction sends a confirmation email, then hits a limit and rolls back the record, and the customer has an email for an order that doesn't exist.
+
+Two failure modes, not one. The clean case is a single obvious insert-in-loop. The nasty case is a transaction that usually passes and occasionally doesn't — a rollup that's fine at 50 child records and dies at 300, or CPU that's fine until a Flow and three triggers all fire on the same save. Those don't reproduce in a sandbox with test data and only surface under production volume. That's the category worth designing against.
+
+*****************************************************************************************************************************************************************************************************************************************************
+
+Handling large data volumes
+
+"Large" has two distinct meanings and they need different tools.
+
+Many records to process → Batch Apex
+
+When you need to touch more records than one transaction's limits allow, Batch Apex splits the work into chunks, each chunk running as its own transaction with a fresh set of limits.
+
+apex
+public class AccountRollupBatch implements Database.Batchable<sObject>, Database.Stateful {
+
+    public Database.QueryLocator start(Database.BatchableContext bc) {
+        // getQueryLocator streams up to 50 MILLION records — not the 10k SOQL cap
+        return Database.getQueryLocator('SELECT Id, AnnualRevenue FROM Account');
+    }
+
+    public void execute(Database.BatchableContext bc, List<Account> scope) {
+        // 'scope' is one chunk (default 200). Fresh 100 SOQL / 150 DML / 10s CPU here.
+        for (Account a : scope) { /* ... */ }
+        update scope;
+    }
+
+    public void finish(Database.BatchableContext bc) {
+        // runs once at the end — chain the next job, send a summary email
+    }
+}
+
+// invoke with an explicit, smaller scope when per-record work is heavy
+Database.executeBatch(new AccountRollupBatch(), 100);
+
+The three things that matter:
+
+Scope size is your CPU/heap lever. Default 200; drop it to 50 or 20 when each record does queries or callouts. Smaller scope = more transactions but each stays under limit. This is the single most common Batch tuning knob.
+Database.Stateful preserves instance variables across chunks (for a running total or error collection). Without it, everything resets each execute — and note statics reset every chunk regardless, which is why the recursion-guard pattern behaves differently in batch.
+start returns a QueryLocator which streams up to 50M rows, bypassing the 50k SOQL-rows-per-transaction limit entirely. That's the mechanism that makes "process the whole org" possible.
+
+*******************************************************************************************************************************************************************************************************************
+
+Long-running or external work → Queueable / @future
+
+For asynchronous work that isn't record-set iteration — callouts, chained processing, offloading from a trigger to get the doubled async limits:
+
+apex
+public class RollupQueueable implements Queueable, Database.AllowsCallouts {
+    private Set<Id> ids;
+    public RollupQueueable(Set<Id> ids) { this.ids = ids; }
+
+    public void execute(QueueableContext ctx) {
+        // 200 SOQL, 12MB heap, 60s CPU here — vs 100/6/10 in the trigger
+        // chain the next batch:
+        if (moreWork) System.enqueueJob(new RollupQueueable(nextIds));
+    }
+}
+
+Queueable chains unlimited in production (5 only in Dev/Trial orgs), takes complex types (Set<Id>, sObjects — @future only takes primitives), and gets the async limits. It has largely replaced @future.
+
+Scheduled cleanup, incremental processing
+
+For steady-state volume rather than a one-off migration: a scheduled Batch nightly, or Big Objects when you're storing hundreds of millions of rows you rarely query (archived events, audit logs) — they don't count against standard storage or normal SOQL limits but only support a restricted query pattern.
+
+Query-side techniques for large tables
+Selective queries. Above ~1M rows on an object, a non-selective WHERE (no indexed field, or a filter matching >10% of rows / >333k records) throws System.QueryException: Non-selective query against large object type. Filter on indexed fields — Id, Name, external Id, audit fields, or custom fields marked External ID/Unique.
+Skinny tables and custom indexes — request from Salesforce Support for chronically slow large-object queries.
+QueryLocator cursor in Batch instead of pulling a giant list into heap.
+
+******************************************************************************************************************************************************************************************************************************************************************
+
+Strategies to avoid hitting limits
+
+Ordered by how much they actually buy you.
+
+1. Bulkify — the collect → query → map → iterate shape. Covers the SOQL-count, DML-count, and (via the Map) CPU limits at once. This is 80% of staying safe. Never a query or DML inside a loop; collect keys into a Set, one query outside, Map for O(1) lookup.
+
+2. Query only what you need. Fewer fields = less heap. WHERE clauses to shrink the row count toward the 50k / 6MB ceilings. Aggregate (SUM, COUNT with GROUP BY) instead of pulling rows and counting in Apex — one query does what a loop would. Use SOQL for loops (for (X x : [SELECT...])) rather than for (X x : listVar) when the set is large, because the query-loop form streams in 200-row batches and keeps heap flat.
+
+3. DML only what changed. Compare current vs. computed before adding to the update list; a no-op update still runs the full order of execution and burns a statement. This is bulkification and recursion defense in one move.
+
+4. Guard the CPU limit specifically — the one bulkification alone doesn't fix. No nested loops over two collections (Map-ify one side). Avoid heavy work inside triggers that fire on every save; move genuinely expensive computation async. Watch that a Flow + multiple triggers + rollups on one save share the same 10s budget.
+
+5. Move work out of the synchronous transaction. Offloading to Queueable/Batch doesn't just get you the doubled async limits — it resets the clock entirely, because it's a new transaction. A trigger that enqueues a Queueable for the heavy part keeps the user-facing save fast and under sync limits.
+
+6. Cache instead of re-querying. Custom Settings and Custom Metadata (getInstance(), getAll()) don't count against SOQL. Static variables cache a result within a transaction so repeated handler passes don't re-query. Platform Cache for cross-transaction data.
+
+7. Design for idempotence and recursion control so the order of execution's re-firing (workflow updates, rollups, flows) doesn't multiply your query and DML counts. The Set<Id> guard, and change-detection gating, both keep a single logical operation from consuming limits three times.
+
+8. Instrument. Limits.getQueries() / getLimitQueries(), getDmlStatements(), getCpuTime(), getHeapSize() are free to call. Log them in complex transactions; assert on them in bulk tests (the @TestVisible counter trick) so a regression that doubles your query count fails CI instead of production.
+
+9. Test at 201+ records. The number that forces two trigger chunks and exposes both the static-boolean recursion bug and any accidental per-record query. A test at 200 or fewer proves nothing about bulk safety.
+
+The through-line: limits are per transaction, and the two escape hatches are do less per record (bulkify, filter, cache, dedupe DML) and use more transactions (Batch chunks, async offload). Almost every real fix is one of those two.
+
+One caveat worth keeping in your notes: the selective-query thresholds (the 10% / 333k figures, the 1M-row trigger point) and the async 24-hour ceilings are the numbers Salesforce tunes and that vary by edition, so confirm those against the current Large Data Volumes and query-optimization docs before citing them in a design review — the per-transaction limits from the last message are the stable ones.
