@@ -1,0 +1,65 @@
+Per-transaction governor limits
+
+Limit	                                                 Synchronous	                                                                    Asynchronous
+SOQL queries	                                               100	                                                                       200
+Records retrieved by SOQL                                    50,000	                                                                     50,000
+Records retrieved by Database.getQueryLocator	               10,000	                                                                     10,000
+SOSL queries	                                               20                                                                          20
+Records retrieved by a single SOSL	                         2,000	                                                                     2,000
+DML statements	                                             150	                                                                       150
+Records processed by DML	                                   10,000	                                                                     10,000
+Heap	                                                       6 MB	                                                                       12 MB
+CPU time	                                                   10,000 ms	                                                                 60,000 ms
+Callouts	                                                   100	                                                                       100
+Cumulative callout timeout	                                 120 s	                                                                     120 s
+@future calls	                                               50	                                                                         50
+Queueable jobs enqueued	                                     50	                                                                         50
+Database.emptyRecycleBin rows	                               10,000	                                                                     10,000
+sendEmail methods	                                           10	                                                                         10
+EventBus.publish (immediate) events	                         150	                                                                       150
+Push notification method calls	                             10	                                                                         10
+Push notifications per call	                                 2,000	                                                                     2,000
+Stack depth (nested method)	                                 1,000	                                                                     1,000
+
+***********The four that double for async — SOQL 100→200, heap 6→12 MB, CPU 10s→60s — plus DML rows staying flat are exactly what interviewers probe when they ask "why move this to a Queueable." Note DML statements (150) and DML rows (10,000) do not change async; only SOQL count, heap, and CPU do.
+
+***********The distinctions that trip people up
+
+Statement vs. row. insert listOf500 is 1 DML statement and 500 rows. This is the whole reason bulkification works — 200 inserts in a loop is 200 statements (dead at 151), but one insert of a 200-element list is 1 statement and 200 rows. Same split on SOQL: 100 queries vs. 50,000 rows returned across all of them.
+
+CPU time excludes waiting. The 10s clock counts Apex execution only — not callout round-trips, not DML database time, not SOQL wait. So a slow external API doesn't burn CPU (it burns the 120s cumulative callout timeout instead), but a nested loop over 200×200 records burns CPU fast with zero queries. This is why "no SOQL in loops" isn't the only rule — a tight loop with no queries can still blow the CPU limit.
+
+The getQueryLocator 10,000 vs. SOQL 50,000. A plain SOQL for loop can pull 50,000 rows. Database.getQueryLocator (what a Batch Apex start returns) is capped at 10,000 in a normal transaction — but Batch Apex itself processes up to 50 million records because each execute chunk is its own transaction with its own fresh limits.
+
+**************************************************************************************************************************************************************************************************************************************************
+
+Limits that are NOT per-transaction
+
+These reset on a different clock and catch people who only memorized the transaction table:
+
+Limit                                                               	Value	                                                                                    Window
+Async Apex executions (@future + Queueable + Batch + Scheduled)	     250,000 or 200 × user licenses,                                                  whichever is higher	rolling 24h, per org
+Total API calls	                                                     tier-dependent (e.g. 15,000 + 1,000/license)	                                            rolling 24h, per org
+Batch jobs in Apex Flex Queue (Holding)	                             100	                                                                                    at a time 
+Batch jobs queued or active	                                         5	                                                                                      at a time
+System.enqueueJob calls per transaction	                             50	                                                                                      per transaction
+Scheduled Apex jobs	                                                 100	                                                                                    at a time
+Concurrent long-running sync requests (>5s)	                         10	                                                                                      per org,concurrent
+Max sync transaction runtime before kill	                           10 min	                                                                                  wall-clock
+
+That async 24-hour limit (250,000 / day org-wide) is the sleeper — it's the one a high-volume integration actually hits in production, and it never shows up in a unit test because tests don't accumulate against it.
+*******************************************************************************************************************************************************************************************************************************************************************************************88
+Things worth knowing exactly
+
+Queueable chaining depth is unlimited in production — you can chain one job to the next indefinitely. It's capped at 5 only in Developer Edition and Trial orgs. A lot of study guides state "5" without the caveat, which is wrong for the org you'll actually deploy to.
+
+@future can't chain at all — you cannot call a future method from another future method. Queueable can, which is one of the main reasons Queueable superseded @future for anything sequential.
+
+SOQL for loop batching: for (Account a : [SELECT ...]) internally fetches in batches of 200, which keeps heap down — the platform doesn't materialize all 50,000 rows at once. for (Account a : listVariable) does not, because the list is already fully in heap. Relevant when you're near the 6 MB ceiling.
+
+Limits methods are free to call and don't count against anything — Limits.getQueries(), Limits.getLimitQueries(), etc. Instrument with them liberally; that's what the @TestVisible counters in the earlier bulk test were doing.
+
+One accuracy note for your notes file: a handful of these (the API-call tiers, the async 24h formula) vary by org edition and license count, and Salesforce occasionally revises the non-transaction ones between releases. The per-transaction table above is stable and has been for years, but if you're citing the org-level numbers in an interview or a design doc, it's worth confirming against the current Apex Developer Guide limits page for the specific edition — those are the ones that move.
+
+
+
