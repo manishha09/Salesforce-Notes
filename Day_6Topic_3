@@ -1,0 +1,251 @@
+Break-then-fix: the four you'll actually hit
+
+For each, the code that throws, the exact exception, and the fix — plus a test that proves the fix at 201 records.
+
+1. SOQL in a loop → Too many SOQL queries: 101
+apex
+// ❌ BREAKS at record 101
+public static void tagOpps_broken(List<Opportunity> opps) {
+    for (Opportunity o : opps) {
+        Account a = [SELECT Rating FROM Account WHERE Id = :o.AccountId];  // query per record
+        o.Description = a.Rating;
+    }
+}
+
+The query is inside the loop, so 200 records = 200 queries. It dies the instant the 101st runs — you never even reach record 200.
+
+apex
+// ✅ FIXED — 1 query regardless of volume
+public static void tagOpps_fixed(List<Opportunity> opps) {
+
+    Set<Id> acctIds = new Set<Id>();
+    for (Opportunity o : opps) {
+        if (o.AccountId != null) acctIds.add(o.AccountId);
+    }
+    if (acctIds.isEmpty()) return;
+
+    Map<Id, Account> accts = new Map<Id, Account>([
+        SELECT Rating FROM Account WHERE Id IN :acctIds
+    ]);
+
+    for (Opportunity o : opps) {
+        Account a = accts.get(o.AccountId);
+        if (a != null) o.Description = a.Rating;
+    }
+}
+
+Collect keys → one query keyed by Id → O(1) lookups. Same instinct as killing an N+1.
+
+*******************************************************************************************************************************************************************************************************
+
+2. DML in a loop → Too many DML statements: 151
+apex
+// ❌ BREAKS at record 151
+public static void createTasks_broken(List<Opportunity> opps) {
+    for (Opportunity o : opps) {
+        insert new Task(WhatId = o.Id, Subject = 'Follow up');  // 1 statement each
+    }
+}
+
+Remember the statement-vs-row distinction: this is 200 statements. The fix turns it into 1 statement of 200 rows.
+
+apex
+// ✅ FIXED — 1 DML statement, 200 rows
+public static void createTasks_fixed(List<Opportunity> opps) {
+    List<Task> toInsert = new List<Task>();
+    for (Opportunity o : opps) {
+        toInsert.add(new Task(WhatId = o.Id, Subject = 'Follow up'));
+    }
+    if (!toInsert.isEmpty()) insert toInsert;
+}
+
+***********************************************************************************************************************************************************************************************************
+
+3. Nested loop → Apex CPU time limit exceeded
+
+This is the sneaky one — zero queries, zero DML, still dies. Bulkification-by-rote ("no SOQL in loops") doesn't catch it.
+
+apex
+// ❌ BREAKS — O(n²), ~40,000 iterations at 200×200, blows 10s CPU
+public static void matchContacts_broken(List<Opportunity> opps, List<Contact> allContacts) {
+    for (Opportunity o : opps) {
+        for (Contact c : allContacts) {              // inner scan per outer record
+            if (c.AccountId == o.AccountId) {
+                o.Description = c.Email;
+            }
+        }
+    }
+}
+apex
+// ✅ FIXED — pre-index one side into a Map, O(n)
+public static void matchContacts_fixed(List<Opportunity> opps, List<Contact> allContacts) {
+
+    Map<Id, Contact> byAccount = new Map<Id, Contact>();
+    for (Contact c : allContacts) {
+        byAccount.put(c.AccountId, c);               // one pass to build the index
+    }
+
+    for (Opportunity o : opps) {
+        Contact c = byAccount.get(o.AccountId);      // O(1) instead of a scan
+        if (c != null) o.Description = c.Email;
+    }
+}
+
+Two loops that run once each (n + n) instead of one loop inside another (n × n). The CPU limit counts Apex execution time, so collapsing the iteration count is the whole fix.
+
+************************************************************************************************************************************************************************************************************
+
+4. Heap → Apex heap size too large
+apex
+// ❌ BREAKS — materializes millions of rows + all fields into 6MB heap
+public static void reportAll_broken() {
+    List<Account> all = [SELECT Id, Name, Description, /* ...50 fields... */ FROM Account];
+    Integer count = 0;
+    for (Account a : all) { count++; }
+}
+apex
+// ✅ FIXED — SOQL for-loop streams in 200-row chunks, heap stays flat
+public static void reportAll_fixed() {
+    Integer count = 0;
+    for (Account a : [SELECT Id FROM Account]) {   // only the field you use, chunked fetch
+        count++;
+    }
+}
+
+Two fixes stacked: for (X x : [SELECT...]) streams rather than loading everything at once, and querying only Id instead of 50 fields cuts per-row heap. For truly large volumes this becomes Batch Apex, where each chunk is a fresh 6 MB.
+
+The test that proves it — and catches a fix that only looks fixed
+apex
+@IsTest
+private class GovernorLimitTest {
+
+    @IsTest
+    static void fixedVersion_survives201() {
+
+        Account a = new Account(Name = 'Parent');
+        insert a;
+
+        List<Opportunity> opps = new List<Opportunity>();
+        for (Integer i = 0; i < 201; i++) {          // 201 forces 2 chunks
+            opps.add(new Opportunity(
+                Name = 'Opp ' + i, StageName = 'Prospecting',
+                CloseDate = Date.today().addDays(30), AccountId = a.Id
+            ));
+        }
+        insert opps;
+
+        Test.startTest();
+        LimitDemo.createTasks_fixed(opps);
+        Test.stopTest();
+
+        // proves ALL processed, and proves it was 1 DML not 201
+        Assert.areEqual(201, [SELECT COUNT() FROM Task]);
+        Assert.areEqual(1, Limits.getDmlStatements(),
+            'Must be a single bulk DML, not one-per-record');
+    }
+}
+
+The Assert on Limits.getDmlStatements() is what makes this a real test — a version that passed the count assertion but still looped its DML would fail here.
+
+*************************************************************************************************************************************************************************************************************
+
+Efficient query practice
+
+The queries below go from "works" to "works at scale." Everything is about doing more in the query and less in Apex.
+
+Aggregate instead of counting in Apex
+apex
+// ❌ pulls every row into heap just to sum
+Decimal total = 0;
+for (Opportunity o : [SELECT Amount FROM Opportunity WHERE AccountId = :acctId]) {
+    total += o.Amount;
+}
+
+// ✅ database does the math, returns one row
+AggregateResult ar = [
+    SELECT SUM(Amount) total FROM Opportunity WHERE AccountId = :acctId
+];
+Decimal total = (Decimal) ar.get('total');
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+GROUP BY for the bulk version of the same thing
+apex
+// one query computes the sum for EVERY account at once
+Map<Id, Decimal> totalsByAccount = new Map<Id, Decimal>();
+for (AggregateResult ar : [
+    SELECT AccountId aid, SUM(Amount) total
+    FROM Opportunity
+    WHERE AccountId IN :acctIds AND StageName = 'Closed Won'
+    GROUP BY AccountId
+]) {
+    totalsByAccount.put((Id) ar.get('aid'), (Decimal) ar.get('total'));
+}
+
+HAVING filters the aggregated groups — e.g. GROUP BY AccountId HAVING SUM(Amount) > 100000 returns only high-value accounts, without pulling the rest.
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Relationship queries — one query instead of two round trips
+apex
+// Parent → children (subquery). Contacts arrive nested, no second query.
+for (Account a : [
+    SELECT Name, (SELECT Email FROM Contacts WHERE Email != null)
+    FROM Account WHERE Id IN :acctIds
+]) {
+    for (Contact c : a.Contacts) { /* ... */ }
+}
+
+// Child → parent (dot notation). Traverse up to 5 levels.
+for (Contact c : [
+    SELECT LastName, Account.Name, Account.Owner.Email
+    FROM Contact WHERE AccountId IN :acctIds
+]) {
+    String rep = c.Account.Owner.Email;
+}
+
+Child→parent traverses 5 relationships deep; parent→child subqueries go 1 level. Both replace a query-then-query-again pattern with a single call.
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Selectivity — the large-data-volume killer
+apex
+// ❌ on a 2M-row object: Non-selective query against large object type
+List<Account> old = [SELECT Id FROM Account WHERE Description != null];
+
+// ✅ filter on an indexed field (Id, Name, external Id, audit fields, or a
+//    custom field flagged External ID / Unique)
+List<Account> recent = [
+    SELECT Id FROM Account
+    WHERE CreatedDate = LAST_N_DAYS:30 AND Type = 'Customer'
+    LIMIT 10000
+];
+
+A filter is selective when it hits an index and matches under ~10% of rows (roughly 333k). Non-selective filters on a large object throw at runtime — and only in production, because your sandbox doesn't have 2M rows.
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Bind the collection, don't build a string
+apex
+// ✅ bind a Set directly — no injection surface, no string building
+Set<Id> ids = someMap.keySet();
+List<Contact> cons = [SELECT Id FROM Contact WHERE AccountId IN :ids];
+
+WHERE Id IN :aSetOfIds binds the whole collection in one query — which is exactly what makes the collect→query→map pattern possible. (And when you do need dynamic SOQL, String.escapeSingleQuotes on any user input, or Database.queryWithBinds — same injection reasoning you covered in the SOQL security days.)
+
+*************************************************************************************************************************************************************************************************************************
+
+Quick reference
+Instead of	                                                                                                               Do
+Query in a loop	                                                                                        Collect Ids → one WHERE Id IN :set → Map
+Looping to sum/count	                                                                                  SUM() / COUNT() + GROUP BY
+Two queries (parent, then children)	                                                                    One subquery or dot-notation query
+SELECT *-style field lists	                                                                            Only fields you read (heap)
+for (x : bigListVariable)	                                                                              for (x : [SELECT...]) (streams in 200s)
+Non-indexed WHERE on big objects	                                                                      Filter on indexed/selective fields + LIMIT
+String-concatenated filters	                                                                            Bind variables (:collection)
+
+A practice drill worth doing: take any query you've written, and for each one ask "what happens at 2 million rows?" If the answer involves loading them into heap or scanning a non-indexed field, that's the one to rewrite. The queries that survive that question are the efficient ones.
+
+Given you're at Day 33-ish and just covered limits, the natural next block is asynchronous Apex — Batch, Queueable, @future, Scheduled — since that's the "use more transactions" escape hatch these fixes keep pointing at, and it's heavily tested on the PD2.
+
