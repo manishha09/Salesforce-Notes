@@ -1,0 +1,73 @@
+When to use @future
+
+Four situations, in rough order of how often they actually come up:
+
+Callouts from triggers. A trigger runs inside an open transaction with uncommitted DML. Salesforce blocks HTTP callouts in that state — You have uncommitted work pending. Deferring the callout to a future method runs it in a fresh transaction after commit.
+
+Isolating mixed DML (detail below).
+
+Escaping synchronous governor limits. Async context gets its own bucket with higher ceilings: 12 MB heap vs 6, 60s CPU vs 10, 200 callouts vs 100. If a synchronous path is brushing against CPU time, moving the heavy part async buys headroom.
+
+Fire-and-forget work where the user shouldn't wait — audit logging, notification dispatch, cache priming, syncing to an external system.
+
+Caveat worth repeating: for anything new, Queueable covers all of these and does it better (non-primitive params, job ID for monitoring, chaining). @future survives mainly because it's a one-liner from a trigger with no class instantiation.
+
+************************************************************************************************************************************************************************************************************************************************
+Can you call a future from a future?
+
+No.
+
+System.AsyncException: Future method cannot be called from a future or batch method.
+
+Same restriction applies to calling a future from Batch Apex execute(). The reason is queue-flooding protection — unbounded self-chaining would let one transaction spawn arbitrary async work.
+
+Workarounds:
+
+Queueable chaining — call System.enqueueJob() from inside a Queueable's execute(). One child job per parent, chain depth unlimited in production (capped at 5 in Developer/Trial orgs). This is the standard answer.
+Batch finish() — can enqueue a Queueable or start another batch job.
+Scheduled Apex — System.scheduleBatch() or a schedulable that kicks off the next step.
+
+If an interviewer asks this, the follow-up is almost always "so how do you chain async work?" — lead with Queueable.
+
+*************************************************************************************************************************************************************************************************************************************************
+
+Mixed DML error
+
+Salesforce splits objects into two categories:
+
+Setup objects — User, UserRole, Group, GroupMember, Permission Set, PermissionSetAssignment, QueueSObject, Territory, FieldPermissions, ObjectPermissions
+Non-setup objects — Account, Contact, Opportunity, all custom objects
+
+You cannot perform DML on both categories in the same transaction:
+
+MIXED_DML_OPERATION: DML operation on setup object is not permitted 
+after you have updated a non-setup object (or vice versa)
+
+The underlying reason is that setup and non-setup data live in different storage with different commit semantics — Salesforce can't guarantee an atomic rollback across both, so it refuses the combination outright rather than risk a partial commit.
+
+How @future fixes it: the future method executes in its own separate transaction. The two DML operations are never co-resident, so the restriction never applies.
+
+apex
+public class OnboardingService {
+
+    public static void onboard(Contact c, Id userId) {
+        insert c;                          // non-setup DML
+        assignPermSet(userId);             // deferred → separate transaction
+    }
+
+    @future
+    private static void assignPermSet(Id userId) {
+        PermissionSet ps = [SELECT Id FROM PermissionSet WHERE Name = 'Portal_Access'];
+        insert new PermissionSetAssignment(
+            AssigneeId = userId,
+            PermissionSetId = ps.Id
+        );                                 // setup DML, now isolated
+    }
+}
+
+Two things to flag:
+
+Queueable solves this identically, and gives you a job ID so you can tell whether the second half actually succeeded. With @future, if the permission set assignment fails, the caller has no idea.
+In tests only, System.runAs() also sidesteps mixed DML by resetting the transaction context. It's a test-only tool — it won't help in production code.
+
+***************************************************************************************************************************************************************************************************************************************************
