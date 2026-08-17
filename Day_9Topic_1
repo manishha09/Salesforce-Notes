@@ -1,0 +1,255 @@
+Database.Batchable — Batch Apex
+
+The interface for processing large record volumes by splitting work into chunks, each chunk running as its own transaction with its own governor limits.
+
+apex
+global class AccountCleanupBatch implements Database.Batchable<sObject> {
+
+    global Database.QueryLocator start(Database.BatchableContext bc) { ... }
+    global void execute(Database.BatchableContext bc, List<sObject> scope) { ... }
+    global void finish(Database.BatchableContext bc) { ... }
+}
+
+Invoked with Database.executeBatch(new AccountCleanupBatch(), 200), which returns the AsyncApexJob ID.
+
+***********************************************************************************************************************************************************************************************************************************************
+
+The three methods
+
+
+start()
+
+Runs once, at the beginning. Its job is to define the total record set. Returns either a QueryLocator or an Iterable<sObject>.
+
+apex
+global Database.QueryLocator start(Database.BatchableContext bc) {
+    return Database.getQueryLocator([
+        SELECT Id, Name, Last_Activity__c
+        FROM Account
+        WHERE Sync_Status__c = 'Pending'
+    ]);
+}
+
+The returned set is snapshotted at start time. Records that later stop matching the filter are still processed; records that newly match are not picked up. Because of this, execute() should re-verify preconditions rather than trusting the query filter.
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+execute()
+
+Runs once per chunk. Each invocation is a fresh transaction with a fresh set of governor limits — this is the whole point of batch.
+
+apex
+global void execute(Database.BatchableContext bc, List<Account> scope) {
+    List<Account> toUpdate = new List<Account>();
+
+    for (Account a : scope) {
+        if (a.Sync_Status__c != 'Pending') continue;   // re-verify
+        a.Sync_Status__c = 'Processed';
+        toUpdate.add(a);
+    }
+
+    Database.update(toUpdate, false);   // partial success
+}
+
+Type the scope parameter concretely (List<Account>) rather than List<sObject> when you can — cleaner, and you skip the casting.
+
+An uncaught exception in one execute() rolls back only that chunk. Other chunks are unaffected and the job continues, though the job status ends as "Completed with failures."
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+finish()
+
+Runs once, after all chunks. Post-processing: send a summary email, chain the next job, update a control record.
+
+apex
+global void finish(Database.BatchableContext bc) {
+    AsyncApexJob job = [
+        SELECT Id, Status, NumberOfErrors, JobItemsProcessed,
+               TotalJobItems, CreatedBy.Email, ExtendedStatus
+        FROM AsyncApexJob WHERE Id = :bc.getJobId()
+    ];
+    // notify, chain, log
+}
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+******************************************************************************************************************************************************************************************************************************************************
+
+QueryLocator vs Iterable
+	                                                                                  Database.QueryLocator                                                                                        	Iterable<sObject>
+Record ceiling	                                                                        50 million	                                                                                 50,000 (counts against the normal SOQL row limit)
+Source	                                                                             A single SOQL query	                                                                          Anything — API response, computed list, custom Iterator
+Chunking	                                                                      Server-side, streamed via cursor	                                                                       Whole collection materialized in start()
+Relationship subqueries	                                                               Not supported	                                                                                                  Supported
+Default when	                                                                          Almost always	                                                                               Only when a plain query can't express the set
+
+**********************************************************************************************************************************************************************************************************************************************
+
+QueryLocator is a server-side cursor. Salesforce never holds all 50M records in memory — it streams chunks. That's why the ceiling is so high and why it's the default choice.
+
+Iterable exists for cases where the record set isn't a straight SOQL result:
+
+global Iterable<sObject> start(Database.BatchableContext bc) {
+    // Records derived from an external system, or from post-query filtering
+    return new List<Account>(computeEligibleAccounts());
+}
+
+The 50,000 cap is the killer — you build everything in start(), so it's bound by the standard query-rows limit. If you find yourself reaching for Iterable because your criteria are too complex for SOQL, consider instead querying broadly with a QueryLocator and filtering inside execute().
+
+For genuinely custom traversal, implement Iterator<sObject> and expose it through an Iterable:
+
+apex
+global class ChunkedIterable implements Iterable<sObject> {
+    global Iterator<sObject> iterator() { return new ChunkedIterator(); }
+}
+
+********************************************************************************************************************************************************************************************************************************************************************
+
+Scope size
+
+Second argument to executeBatch. Default 200, max 2,000.
+
+Database.executeBatch(new MyBatch(), 50);
+
+Sizing is a tradeoff between per-chunk limits and total chunk count:
+
+Lower it (1–50) when each record does expensive work — callouts, complex DML cascades, heavy CPU. A callout-per-record batch with a scope of 100 will hit the 100-callout limit exactly; use 50 for headroom. Records with deep trigger logic often need 20–50.
+Keep 200 for straightforward field updates.
+Raise it (up to 2,000) rarely — for very light read-mostly processing where chunk overhead dominates.
+
+Key detail: if a chunk fails on a governor limit, Salesforce may retry it with a smaller scope. But the chunk count itself is limited — total chunks across a job can't exceed the daily async limit, and a scope that's too small on a 50M-record job produces an absurd number of chunks.
+
+Database.executeBatch with a QueryLocator ignores scope sizes above 2,000. With Iterable, scope behaves the same but you're already capped at 50k total.
+
+******************************************************************************************************************************************************************************************************************************************************************************************
+
+Database.Stateful
+
+By default, instance variables reset between execute() calls. Each chunk gets a fresh deserialization of the class with only static final values preserved. Implement Database.Stateful to persist instance state across chunks:
+
+global class RevenueRollupBatch implements Database.Batchable<sObject>, Database.Stateful {
+
+    global Integer recordsProcessed = 0;
+    global Decimal totalRevenue = 0;
+    global List<String> errors = new List<String>();
+
+    global void execute(Database.BatchableContext bc, List<Opportunity> scope) {
+        for (Opportunity o : scope) {
+            recordsProcessed++;
+            totalRevenue += (o.Amount == null ? 0 : o.Amount);
+        }
+    }
+
+    global void finish(Database.BatchableContext bc) {
+        // Values survived all chunks
+        System.debug(recordsProcessed + ' opps, total ' + totalRevenue);
+    }
+}
+
+Caveats worth knowing:
+
+Only instance variables persist. Statics still reset.
+State is serialized between chunks, so it counts against heap and everything held must be serializable. Don't accumulate large collections — a List<String> of errors across 50M records will blow up. Cap it, or write to a custom object instead.
+Stateful batches can run slower, since serialization happens between every chunk.
+Common legitimate uses: running counters, aggregation totals, a bounded error list, an ID captured in start() that finish() needs.
+
+*******************************************************************************************************************************************************************************************************************************************************************
+
+Chaining batches
+
+finish() is the only place you can start another batch job from within a batch.
+
+global void finish(Database.BatchableContext bc) {
+    AsyncApexJob job = [
+        SELECT NumberOfErrors, JobItemsProcessed, TotalJobItems
+        FROM AsyncApexJob WHERE Id = :bc.getJobId()
+    ];
+
+    if (job.NumberOfErrors == 0) {
+        Database.executeBatch(new AccountRollupBatch(), 200);
+    } else {
+        notifyFailure(job);
+    }
+}
+
+Rules and constraints:
+
+Only one batch can be chained from finish() in practice — you can call executeBatch but you're bound by the 5-concurrent-batch-jobs limit and the 100-jobs-in-flex-queue limit.
+Chaining from execute() is not allowed.
+finish() can also enqueue a Queueable or schedule a job — often cleaner for lightweight follow-up work.
+Developer/Trial orgs cap chain depth at 5. Production is unbounded, which means a bug that chains unconditionally will run forever. Always gate the chain on a terminating condition.
+
+A guard pattern for iterative chains:
+
+global class RecursiveBatch implements Database.Batchable<sObject>, Database.Stateful {
+
+    private Integer depth;
+
+    global RecursiveBatch(Integer depth) { this.depth = depth; }
+
+    global void finish(Database.BatchableContext bc) {
+        Integer remaining = [SELECT COUNT() FROM Account WHERE Needs_Processing__c = true];
+
+        if (remaining > 0 && depth < 10) {
+            Database.executeBatch(new RecursiveBatch(depth + 1), 200);
+        }
+    }
+}
+
+Two termination conditions — work remaining and a hard depth cap. The depth cap is the one that saves you when the "work remaining" query has a bug.
+
+******************************************************************************************************************************************************************************************************************************************
+
+Job-level limits
+Limit	                                                                       Value
+Batch jobs queued/active concurrently	                                          5
+Jobs in the Apex flex queue (Holding)	                                         100
+Batch executions per rolling 24h	                                             250,000 or 200 × licenses, whichever is higher
+start() heap	                                                                 12 MB
+execute() heap	                                                               12 MB
+Records via QueryLocator	                                                     50,000,000
+Records via Iterable	                                                         50,000
+Callouts per execute()	                                                       100 (requires Database.AllowsCallouts)
+
+For callouts, implement the marker interface:
+global class SyncBatch implements Database.Batchable<sObject>, Database.AllowsCallouts { }
+
+************************************************************************************************************************************************************************************************************************************************
+
+Testing
+
+@IsTest
+static void processesAllRecords() {
+    List<Account> accts = new List<Account>();
+    for (Integer i = 0; i < 200; i++) {
+        accts.add(new Account(Name = 'Test ' + i, Sync_Status__c = 'Pending'));
+    }
+    insert accts;
+
+    Test.startTest();
+    Database.executeBatch(new AccountCleanupBatch(), 200);
+    Test.stopTest();       // batch runs to completion here
+
+    System.assertEquals(200, [
+        SELECT COUNT() FROM Account WHERE Sync_Status__c = 'Processed'
+    ]);
+}
+
+The critical constraint: only one execute() invocation runs in a test context regardless of scope size. Keep test data under one chunk, or your assertions will be wrong. To exercise multi-chunk behavior — particularly Database.Stateful accumulation — call execute() directly with hand-built scopes:
+
+MyBatch b = new MyBatch();
+b.execute(null, chunkOne);
+b.execute(null, chunkTwo);
+System.assertEquals(400, b.recordsProcessed);
+
+********************************************************************************************************************************************************************************************************************************************
+
+Choosing between async types
+	Use when
+@future	Fire-and-forget, mixed DML split, callout from trigger. Legacy default.
+Queueable	Non-primitive params, need a job ID, need chaining. Modern default for most async.
+Batch	Record volume exceeds what one transaction can handle. The volume tool.
+Schedulable	Time-based trigger; typically just kicks off a batch.
+
+If the record count is bounded and modest, Queueable is simpler. Batch earns its complexity once you're past roughly 10,000 records or need the per-chunk limit reset
+
+
+
