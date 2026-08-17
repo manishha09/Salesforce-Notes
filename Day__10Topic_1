@@ -1,1 +1,196 @@
+Queueable — the modern async default
+apex
+public class ErpSyncJob implements Queueable {
+    public void execute(QueueableContext ctx) { ... }
+}
 
+Id jobId = System.enqueueJob(new ErpSyncJob(accounts));
+
+One method, one interface. The interesting part is everything @future couldn't do.
+
+***************************************************************************************************************************************************************
+
+Advantages over @future
+	                                                                           @future	                                                                                                          Queueable
+Parameters	                                                     Primitives + collections of primitives	                                                                Any type — sObjects, custom classes, Maps of objects
+Return	                                                                     void, no handle	                                                                                  Job ID (AsyncApexJob) for monitoring
+Chaining	                                                                     Impossible	                                                                                Yes — one child per parent, unlimited depth in production
+Callable from                                                             	Trigger, sync Apex	                                                                          Trigger, sync Apex, Queueable, Batch finish(), Schedulable
+Delay	                                                                            None	                                                                                     System.enqueueJob(job, delayMinutes) — up to 10 min
+Error recovery	                                                                  None	                                                                                                   Transaction Finalizers
+Testing	                                                                     Test.stopTest()	                                                                                              Test.stopTest() (same)
+Limit	                                                                        50/transaction	                                                                                    50 enqueues/transaction, 1 from within a Queueable
+
+*****************************************************************************************************************************************************************************************************************************************
+
+1. Complex types
+
+This is the day-to-day win. State lives as member variables, no re-query needed:
+
+apex
+public class OpportunityScorer implements Queueable {
+
+    private List<Opportunity> opps;              // sObjects, directly
+    private ScoringConfig config;                // custom Apex class
+    private Map<Id, List<OpportunityLineItem>> linesByOpp;
+
+    public OpportunityScorer(List<Opportunity> opps, ScoringConfig config) {
+        this.opps = opps;
+        this.config = config;
+    }
+
+    public void execute(QueueableContext ctx) {
+        for (Opportunity o : opps) {
+            o.Score__c = config.score(o);
+        }
+        update opps;
+    }
+}
+
+With @future you'd pass Set<Id>, re-query everything, and rebuild the config from custom metadata inside the method.
+
+The constraint: everything held must be serializable. No Http, HttpRequest, Savepoint, Database.QueryLocator, or anonymous inner classes capturing non-serializable scope. Mark fields transient if they shouldn't cross the boundary. Total serialized state counts against heap.
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+2. Monitoring
+apex
+Id jobId = System.enqueueJob(new ErpSyncJob(accts));
+
+AsyncApexJob job = [
+    SELECT Id, Status, NumberOfErrors, ExtendedStatus, CompletedDate
+    FROM AsyncApexJob WHERE Id = :jobId
+];
+
+Status moves through Queued → Processing → Completed | Failed | Aborted. You can surface progress to a user in LWC, store the ID on a record, or abort with System.abortJob(jobId). @future gives you none of this — a silent failure stays silent.
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+3. Chaining
+apex
+public class StepOne implements Queueable {
+    public void execute(QueueableContext ctx) {
+        // work
+        System.enqueueJob(new StepTwo());     // one child, runs after this commits
+    }
+}
+
+Rules that matter:
+
+One child job per parent execution. A second enqueueJob throws LimitException.
+Chain depth is unlimited in production, capped at 5 in Developer/Trial orgs. That asymmetry means an unguarded recursive chain passes sandbox testing and runs forever in prod. Always gate on a terminating condition and a hard depth counter.
+Chained jobs are not guaranteed to run immediately — they queue.
+
+public class RecursiveJob implements Queueable {
+    private Integer depth;
+    public RecursiveJob(Integer depth) { this.depth = depth; }
+
+    public void execute(QueueableContext ctx) {
+        List<Account> batch = [SELECT Id FROM Account WHERE Needs_Sync__c = true LIMIT 200];
+        if (batch.isEmpty()) return;
+
+        process(batch);
+
+        if (depth < 50) {                       // hard cap, not just "work remaining"
+            System.enqueueJob(new RecursiveJob(depth + 1));
+        }
+    }
+}
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+4. Callouts and delay
+apex
+public class SyncJob implements Queueable, Database.AllowsCallouts {
+    public void execute(QueueableContext ctx) {
+        HttpResponse res = new Http().send(buildRequest());
+    }
+}
+
+System.enqueueJob(new SyncJob(), 5);   // start ~5 minutes from now (0–10)
+
+The delay is useful for backoff on retries, or letting an external system finish provisioning before you poll it.
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Transaction Finalizers
+
+The gap Queueable had until API v53: if execute() threw, the transaction rolled back and you had no hook to log, notify, or retry. Finalizer fills it.
+
+public class SyncFinalizer implements Finalizer {
+
+    private Id recordId;
+    private Integer attempt;
+
+    public SyncFinalizer(Id recordId, Integer attempt) {
+        this.recordId = recordId;
+        this.attempt = attempt;
+    }
+
+    public void execute(FinalizerContext ctx) {
+
+        if (ctx.getResult() == ParentJobResult.SUCCESS) {
+            update new Account(Id = recordId, Sync_Status__c = 'Synced');
+            return;
+        }
+
+        // UNHANDLED_EXCEPTION — the parent's DML was rolled back,
+        // but this runs in its own transaction, so this DML commits.
+        Exception e = ctx.getException();
+
+        insert new Integration_Log__c(
+            Record_Id__c  = recordId,
+            Error_Type__c = e.getTypeName(),
+            Detail__c     = e.getMessage() + '\n' + e.getStackTraceString(),
+            Job_Id__c     = ctx.getAsyncApexJobId()
+        );
+
+        if (attempt < 3) {
+            System.enqueueJob(new SyncJob(recordId, attempt + 1), attempt * 2);
+        }
+    }
+}
+
+Attached at the top of execute():
+
+public class SyncJob implements Queueable, Database.AllowsCallouts {
+
+    private Id recordId;
+    private Integer attempt;
+
+    public SyncJob(Id recordId, Integer attempt) {
+        this.recordId = recordId;
+        this.attempt = attempt;
+    }
+
+    public void execute(QueueableContext ctx) {
+        System.attachFinalizer(new SyncFinalizer(recordId, attempt));
+
+        // If this throws, the finalizer still runs.
+        HttpResponse res = new Http().send(buildRequest());
+        if (res.getStatusCode() != 200) {
+            throw new CalloutException('ERP returned ' + res.getStatusCode());
+        }
+    }
+}
+
+Key properties:
+
+Runs in its own transaction, after the parent commits or rolls back. That's why its DML survives when the parent's didn't.
+Guaranteed to run on both success and unhandled exception — including governor limit exceptions, which nothing else catches.
+ctx.getResult() returns ParentJobResult.SUCCESS or UNHANDLED_EXCEPTION; getException() gives the throwable; getAsyncApexJobId() and getRequestId() support log correlation.
+One finalizer per Queueable. Attaching a second throws.
+It can enqueue one job, which is what makes retry-with-backoff possible — and is also how you keep a chain alive past a failure, since a failed parent can't enqueue anything itself.
+Attach it first thing in execute(), before anything that might throw.
+Only Queueable supports finalizers. Not @future, not Batch.
+
+When each one still wins
+Situation	                                                                                                          Choice
+Anything new and async	                                                                                          Queueable
+Need retry / guaranteed error logging	                                                                            Queueable + Finalizer
+Mixed DML split, one-line trigger call	                                                                          @future (marginally simpler) or Queueable
+Record volume past ~10k, need per-chunk limit reset	                                                              Batch
+Time-based kickoff	                                                                                              Schedulable, usually launching a Batch or Queueable
+
+*********************************************************************************************************************************************************************************************************************
+The honest summary: @future has no remaining advantage except brevity in trivial cases. Everything it does, Queueable does with observability attached. New code should default to Queueable, and the presence of @future in a codebase is usually a dating marker rather than a design decision.
