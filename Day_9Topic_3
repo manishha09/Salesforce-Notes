@@ -1,0 +1,188 @@
+Batch Class
+
+/**
+ * Flags Accounts that have no Phone value so they can be surfaced
+ * in a data-quality report. Tracks running counts across all chunks.
+ */
+global class AccountMissingPhoneBatch implements Database.Batchable<sObject>,
+                                                  Database.Stateful {
+
+    // Instance variables persist across execute() calls because of Database.Stateful.
+    global Integer recordsProcessed = 0;
+    global Integer recordsUpdated   = 0;
+    global Integer recordsFailed    = 0;
+
+    // Bounded — never let this grow unbounded across millions of records.
+    global List<String> failureMessages = new List<String>();
+    private static final Integer MAX_LOGGED_FAILURES = 20;
+
+    private String notifyEmail;
+
+    global AccountMissingPhoneBatch() {
+        this.notifyEmail = UserInfo.getUserEmail();
+    }
+
+    // ---------- start ----------
+
+    global Database.QueryLocator start(Database.BatchableContext bc) {
+        return Database.getQueryLocator([
+            SELECT Id, Name, Phone, Data_Quality_Flag__c, Last_Audited__c
+            FROM Account
+            WHERE Phone = null
+            ORDER BY CreatedDate
+        ]);
+    }
+
+    // ---------- execute ----------
+
+    global void execute(Database.BatchableContext bc, List<Account> scope) {
+
+        List<Account> toUpdate = new List<Account>();
+
+        for (Account a : scope) {
+            recordsProcessed++;
+
+            // Re-verify. The QueryLocator snapshots at start time, so a record
+            // may have gained a Phone value since the job began.
+            if (String.isNotBlank(a.Phone)) {
+                continue;
+            }
+
+            toUpdate.add(new Account(
+                Id                   = a.Id,
+                Data_Quality_Flag__c = 'Missing Phone',
+                Last_Audited__c      = System.today()
+            ));
+        }
+
+        if (toUpdate.isEmpty()) {
+            return;
+        }
+
+        // Partial success — one bad record shouldn't cost the whole chunk.
+        List<Database.SaveResult> results = Database.update(toUpdate, false);
+
+        for (Integer i = 0; i < results.size(); i++) {
+            if (results[i].isSuccess()) {
+                recordsUpdated++;
+            } else {
+                recordsFailed++;
+                if (failureMessages.size() < MAX_LOGGED_FAILURES) {
+                    failureMessages.add(
+                        toUpdate[i].Id + ': ' + results[i].getErrors()[0].getMessage()
+                    );
+                }
+            }
+        }
+    }
+
+    // ---------- finish ----------
+
+    global void finish(Database.BatchableContext bc) {
+
+        AsyncApexJob job = [
+            SELECT Id, Status, NumberOfErrors, JobItemsProcessed,
+                   TotalJobItems, ExtendedStatus
+            FROM AsyncApexJob
+            WHERE Id = :bc.getJobId()
+        ];
+
+        String body =
+            'Account phone audit complete.\n\n' +
+            'Status: '            + job.Status            + '\n' +
+            'Chunks: '            + job.JobItemsProcessed + ' of ' + job.TotalJobItems + '\n' +
+            'Records processed: ' + recordsProcessed      + '\n' +
+            'Records updated: '   + recordsUpdated        + '\n' +
+            'Records failed: '    + recordsFailed         + '\n';
+
+        if (!failureMessages.isEmpty()) {
+            body += '\nSample failures (first ' + MAX_LOGGED_FAILURES + '):\n'
+                  + String.join(failureMessages, '\n');
+        }
+
+        Messaging.SingleEmailMessage mail = new Messaging.SingleEmailMessage();
+        mail.setToAddresses(new List<String>{ notifyEmail });
+        mail.setSubject('Account Phone Audit — ' + job.Status);
+        mail.setPlainTextBody(body);
+
+        Messaging.sendEmail(new List<Messaging.SingleEmailMessage>{ mail });
+    }
+}
+
+Run it:
+
+Database.executeBatch(new AccountMissingPhoneBatch(), 200);
+
+Why the counters need Database.Stateful
+
+Without it, recordsProcessed resets to 0 at the start of every chunk. Each execute() gets a freshly deserialized instance — only static final values survive. finish() would report the count from the last chunk only, which on a 200-scope job over 10,000 records would read 200 instead of 10,000.
+
+Three things worth flagging about the state here:
+
+failureMessages is capped at 20. An uncapped list across a large job serializes between every chunk and will eventually hit the 12 MB heap limit.
+notifyEmail is set in the constructor and read in finish() — another legitimate use of Stateful, since without it the value would be lost.
+If all you needed were chunk counts, AsyncApexJob.JobItemsProcessed gives you that for free and you could skip Stateful entirely. It's the record-level counters that require it.
+
+*****************************************************************************************************************************************************************************************************************************************
+
+Test Class
+
+@IsTest
+private class AccountMissingPhoneBatchTest {
+
+    @TestSetup
+    static void setup() {
+        List<Account> accts = new List<Account>();
+        for (Integer i = 0; i < 150; i++) {
+            accts.add(new Account(Name = 'No Phone ' + i));           // Phone null
+        }
+        for (Integer i = 0; i < 50; i++) {
+            accts.add(new Account(Name = 'Has Phone ' + i, Phone = '555-0100'));
+        }
+        insert accts;
+    }
+
+    @IsTest
+    static void flagsOnlyAccountsMissingPhone() {
+
+        Test.startTest();
+        Database.executeBatch(new AccountMissingPhoneBatch(), 200);
+        Test.stopTest();
+
+        System.assertEquals(150, [
+            SELECT COUNT() FROM Account WHERE Data_Quality_Flag__c = 'Missing Phone'
+        ], 'All phoneless accounts should be flagged');
+
+        System.assertEquals(0, [
+            SELECT COUNT() FROM Account
+            WHERE Phone != null AND Data_Quality_Flag__c = 'Missing Phone'
+        ], 'Accounts with a phone should be untouched');
+    }
+
+    @IsTest
+    static void statefulCountersAccumulateAcrossChunks() {
+
+        // Only ONE execute() runs in a test context regardless of scope,
+        // so exercise multi-chunk accumulation by calling execute() directly.
+        AccountMissingPhoneBatch b = new AccountMissingPhoneBatch();
+
+        List<Account> all = [SELECT Id, Phone FROM Account WHERE Phone = null];
+        List<Account> chunkOne = new List<Account>();
+        List<Account> chunkTwo = new List<Account>();
+
+        for (Integer i = 0; i < all.size(); i++) {
+            if (i < 75) chunkOne.add(all[i]); else chunkTwo.add(all[i]);
+        }
+
+        Test.startTest();
+        b.execute(null, chunkOne);
+        b.execute(null, chunkTwo);
+        Test.stopTest();
+
+        System.assertEquals(150, b.recordsProcessed, 'Counter must survive both chunks');
+        System.assertEquals(150, b.recordsUpdated);
+        System.assertEquals(0,   b.recordsFailed);
+    }
+}
+
+That second test is the one that actually proves Database.Stateful is doing its job. The first test can't — with only one execute() invocation running under Test.stopTest(), the counters would read correctly even if you removed the interface entirely.
