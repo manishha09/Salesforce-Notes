@@ -1,0 +1,46 @@
+@future — Apex asynchronous execution
+
+Marks a static method to run in a separate thread, later, when platform resources are available. The calling transaction doesn't wait for it.
+
+public class AccountService {
+    @future(callout=true)
+    public static void syncToErp(Set<Id> accountIds) {
+        List<Account> accts = [SELECT Id, Name FROM Account WHERE Id IN :accountIds];
+        // HTTP callout here
+    }
+}
+**************************************************************************************************************************************************************************************************************************************************
+Limitations
+Constraint                                                                               	Detail
+static + void	                                                      Must be static; return type must be void. No way to get a result back directly.
+Primitive params only	                                              Primitives, arrays/collections of primitives. No sObjects, no custom objects. Reason: the record's state could change between enqueue and execution, so you'd act on stale data. Pass Set<Id> and re-query, or serialize to a JSON string.
+No chaining	                                                        Can't call @future from another @future, and can't call one from Batch Apex execute().
+No job handle	                                                      Returns nothing — no AsyncApexJob ID, so monitoring and error recovery are awkward.
+No ordering guarantee	                                              Queued and run whenever; two calls may execute out of order or concurrently.
+Governor caps	                                                      50 future invocations per transaction; org daily limit of 250,000 or 200 × user licenses, whichever is higher.
+Callouts need opt-in	                                             @future(callout=true), otherwise a callout throws CalloutException.
+Not allowed in	                                                    Visualforce constructors, getters, setters.
+Testing	                                                            Must be invoked between Test.startTest() and Test.stopTest(), which forces synchronous execution at stopTest().
+*************************************************************************************************************************************************************************************************************************************************
+Use cases
+
+1. Callouts from triggers. A trigger has uncommitted DML pending, and Salesforce won't allow a callout while a transaction holds open DML — you get You have uncommitted work pending. Deferring the callout to a future method moves it into a fresh transaction after commit.
+
+apex
+trigger AccountTrigger on Account (after insert) {
+    AccountService.syncToErp(Trigger.newMap.keySet());
+}
+
+2. Mixed DML. Setup objects (User, Group, GroupMember, PermissionSetAssignment, UserRole) can't be DML'd in the same transaction as non-setup objects (Account, Contact, custom objects) — MIXED_DML_OPERATION. Isolating one side into a future method splits it into a separate transaction.
+
+apex
+insert newContact;                          // non-setup
+UserService.assignPermSet(newUserId);       // @future — setup object DML
+
+3. Fresh governor limits. Async context gets its own limit bucket, and higher ceilings: 12 MB heap (vs 6), 60s CPU (vs 10), 200 callouts. Useful for offloading heavy processing out of a synchronous request.
+
+Worth knowing
+
+Queueable supersedes @future for most of this: it accepts non-primitive member variables (sObjects, custom types), returns an AsyncApexJob ID for monitoring, supports chaining (one level in a single transaction, 50 in a chain overall), and can be scheduled with a delay. The one thing @future still does more simply is being callable directly from a trigger with a one-liner and no class instantiation. New code generally reaches for Queueable; @future mostly persists in older codebases and in the two classic patterns above.
+
+4. Fire-and-forget work where latency doesn't matter — logging, cache warming, notification dispatch.
