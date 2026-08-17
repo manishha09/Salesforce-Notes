@@ -1,0 +1,260 @@
+Callout from a trigger
+
+public with sharing class ErpSyncService {
+
+    private static final String ENDPOINT = 'callout:ERP_Named_Cred/api/v1/accounts';
+
+    @future(callout=true)
+    public static void syncAccounts(Set<Id> accountIds) {
+
+        if (accountIds == null || accountIds.isEmpty()) {
+            return;
+        }
+
+        // Re-query. The record state at enqueue time is not trustworthy —
+        // this is exactly why sObjects can't be passed as parameters.
+        List<Account> accts = [
+            SELECT Id, Name, AccountNumber, Industry, BillingCountry
+            FROM Account
+            WHERE Id IN :accountIds
+        ];
+
+        if (accts.isEmpty()) {
+            return;
+        }
+
+        List<Account> toUpdate = new List<Account>();
+        List<Integration_Log__c> logs = new List<Integration_Log__c>();
+
+        for (Account a : accts) {
+
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint(ENDPOINT);
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+            req.setTimeout(20000);
+            req.setBody(JSON.serialize(new Map<String, Object>{
+                'externalId' => a.Id,
+                'name'       => a.Name,
+                'number'     => a.AccountNumber,
+                'industry'   => a.Industry,
+                'country'    => a.BillingCountry
+            }));
+
+            try {
+                HttpResponse res = new Http().send(req);
+
+                if (res.getStatusCode() >= 200 && res.getStatusCode() < 300) {
+                    Map<String, Object> body =
+                        (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+
+                    toUpdate.add(new Account(
+                        Id                = a.Id,
+                        ERP_Id__c         = (String) body.get('erpId'),
+                        Last_Synced__c    = System.now(),
+                        Sync_Status__c    = 'Success'
+                    ));
+                } else {
+                    toUpdate.add(new Account(
+                        Id             = a.Id,
+                        Sync_Status__c = 'Failed'
+                    ));
+                    logs.add(buildLog(a.Id, 'HTTP ' + res.getStatusCode(), res.getBody()));
+                }
+
+            } catch (CalloutException e) {
+                toUpdate.add(new Account(Id = a.Id, Sync_Status__c = 'Failed'));
+                logs.add(buildLog(a.Id, 'CalloutException', e.getMessage()));
+            }
+        }
+
+        // No user is watching this transaction — partial success beats
+        // an all-or-nothing rollback that loses every successful sync.
+        if (!toUpdate.isEmpty()) {
+            Database.update(toUpdate, false);
+        }
+        if (!logs.isEmpty()) {
+            Database.insert(logs, false);
+        }
+    }
+
+    private static Integration_Log__c buildLog(Id recordId, String type, String detail) {
+        return new Integration_Log__c(
+            Record_Id__c = recordId,
+            Error_Type__c = type,
+            Detail__c = detail != null ? detail.left(32000) : null
+        );
+    }
+}
+
+Trigger side, with the recursion guard:
+
+trigger AccountTrigger on Account (after insert, after update) {
+
+    if (Trigger.isAfter && (Trigger.isInsert || Trigger.isUpdate)) {
+
+        // The future method updates Account, which re-fires this trigger.
+        // Without a guard you loop until the 50-invocation limit blows.
+        if (!ErpSyncGuard.hasRun && !System.isFuture() && !System.isBatch()) {
+            ErpSyncGuard.hasRun = true;
+
+            Set<Id> changed = new Set<Id>();
+            for (Account a : Trigger.new) {
+                Account old = Trigger.isUpdate ? Trigger.oldMap.get(a.Id) : null;
+                if (old == null || a.Name != old.Name || a.Industry != old.Industry) {
+                    changed.add(a.Id);
+                }
+            }
+
+            if (!changed.isEmpty()) {
+                ErpSyncService.syncAccounts(changed);
+            }
+        }
+    }
+}
+
+public class ErpSyncGuard {
+    public static Boolean hasRun = false;
+}
+
+Two details that matter here: the System.isFuture() check prevents the callback update from re-entering, and filtering to actually-changed fields keeps you well under the 50-future-calls-per-transaction cap on bulk loads.
+**************************************************************************************************************************************************************************************************************************************************************
+
+Mixed DML — setup + non-setup
+
+The scenario: creating a Contact (non-setup) and assigning a permission set to a User (setup) in one flow.
+
+public with sharing class PortalOnboardingService {
+
+    // Entry point — synchronous, non-setup DML only.
+    public static void onboard(Contact c, Id userId, String permSetName) {
+
+        insert c;                                    // non-setup DML
+
+        // Deferred to its own transaction. Attempting the PermissionSetAssignment
+        // inline here throws MIXED_DML_OPERATION.
+        assignPermissionSet(userId, permSetName, c.Id);
+    }
+
+    @future
+    private static void assignPermissionSet(Id userId, String permSetName, Id contactId) {
+
+        List<PermissionSet> psList = [
+            SELECT Id FROM PermissionSet WHERE Name = :permSetName LIMIT 1
+        ];
+
+        if (psList.isEmpty()) {
+            logFailure(contactId, 'Permission set not found: ' + permSetName);
+            return;
+        }
+
+        // Idempotency — the future may be retried, and a duplicate
+        // assignment throws DUPLICATE_VALUE.
+        Integer existing = [
+            SELECT COUNT()
+            FROM PermissionSetAssignment
+            WHERE AssigneeId = :userId AND PermissionSetId = :psList[0].Id
+        ];
+
+        if (existing > 0) {
+            return;
+        }
+
+        Database.SaveResult sr = Database.insert(
+            new PermissionSetAssignment(
+                AssigneeId = userId,
+                PermissionSetId = psList[0].Id
+            ),
+            false
+        );
+
+        if (!sr.isSuccess()) {
+            logFailure(contactId, sr.getErrors()[0].getMessage());
+        }
+    }
+
+    private static void logFailure(Id contactId, String msg) {
+        Database.insert(new Integration_Log__c(
+            Record_Id__c  = contactId,
+            Error_Type__c = 'PermSetAssignment',
+            Detail__c     = msg
+        ), false);
+    }
+}
+
+The direction of the split is a real choice. Here the non-setup DML stays synchronous and the setup DML goes async — right when the Contact is what the user is waiting on. If the setup work is the thing that must succeed for the user to log in, invert it: do the setup DML synchronously and defer the Contact insert.
+
+********************************************************************************************************************************************************************************************************************************************************
+
+Testing both
+apex
+@IsTest
+private class ErpSyncServiceTest {
+
+    private class MockOk implements HttpCalloutMock {
+        public HttpResponse respond(HttpRequest req) {
+            HttpResponse res = new HttpResponse();
+            res.setStatusCode(200);
+            res.setBody('{"erpId":"ERP-99"}');
+            return res;
+        }
+    }
+
+    @IsTest
+    static void syncsAccountSuccessfully() {
+        Account a = new Account(Name = 'Acme');
+        insert a;
+
+        Test.setMock(HttpCalloutMock.class, new MockOk());
+
+        Test.startTest();
+        ErpSyncService.syncAccounts(new Set<Id>{ a.Id });
+        Test.stopTest();          // future fires synchronously here
+
+        Account result = [SELECT ERP_Id__c, Sync_Status__c FROM Account WHERE Id = :a.Id];
+        System.assertEquals('ERP-99', result.ERP_Id__c);
+        System.assertEquals('Success', result.Sync_Status__c);
+    }
+}
+
+For the mixed DML test, you need System.runAs() to create the test User — otherwise the test itself hits mixed DML while setting up data:
+
+@IsTest
+private class PortalOnboardingServiceTest {
+
+    @IsTest
+    static void assignsPermSetWithoutMixedDml() {
+
+        User u;
+        // runAs resets the transaction context — test-only escape hatch.
+        System.runAs(new User(Id = UserInfo.getUserId())) {
+            u = new User(
+                Username  = 'test' + DateTime.now().getTime() + '@example.com',
+                Email     = 'test@example.com',
+                LastName  = 'Test',
+                Alias     = 'tst',
+                ProfileId = [SELECT Id FROM Profile WHERE Name = 'Standard User'].Id,
+                TimeZoneSidKey = 'GMT',
+                LocaleSidKey = 'en_US',
+                EmailEncodingKey = 'UTF-8',
+                LanguageLocaleKey = 'en_US'
+            );
+            insert u;
+        }
+
+        Test.startTest();
+        PortalOnboardingService.onboard(
+            new Contact(LastName = 'Portal User'), u.Id, 'Portal_Access'
+        );
+        Test.stopTest();
+
+        System.assertEquals(1, [
+            SELECT COUNT() FROM PermissionSetAssignment
+            WHERE AssigneeId = :u.Id
+            AND PermissionSet.Name = 'Portal_Access'
+        ]);
+    }
+}
+
+One note on the mixed DML case: @future works, but you get no job ID, so nothing tells you the permission set assignment silently failed. A Queueable doing the same split returns an ID you can poll against AsyncApexJob, and it accepts the Contact sObject directly instead of forcing the re-query. Unless you specifically need the trigger-friendly one-liner, Queueable is the better shape for onboarding flows where you care whether the second half landed.
+
