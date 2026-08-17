@@ -1,0 +1,140 @@
+Question	                                                                                         Answer
+Records processable	                                                                              50,000,000 via QueryLocator; 50,000 via Iterable
+Default batch size	                                                                              200 (max 2,000)
+Database.Stateful	                                                                                When you need instance variables to survive between execute() chunks
+Callouts from batch                                                                              	Yes — implement Database.AllowsCallouts, 100 per chunk
+
+
+How many records?
+
+Database.QueryLocator → 50 million.
+
+The reason it's this high is that a QueryLocator is a server-side cursor, not a materialized list. Salesforce streams records into execute() chunk by chunk; nothing ever holds the full set in memory. The 50M ceiling is the platform limit on what a single cursor will traverse.
+
+Iterable<sObject> → 50,000.
+
+Different mechanism entirely. You build and return the full collection inside start(), so it counts against the standard 50,000-SOQL-rows-per-transaction limit. There's no streaming.
+
+That gap is the main reason to default to QueryLocator. If your selection criteria are too complex for a single SOQL statement, the better move is usually to query broadly with a QueryLocator and filter inside execute() — rather than dropping to Iterable and inheriting a 1,000× smaller ceiling.
+
+*************************************************************************************************************************************************************************************************************************************************************************************************************************
+
+Default batch size
+
+200 if you omit the second argument:
+
+apex
+Database.executeBatch(new MyBatch());        // scope = 200
+Database.executeBatch(new MyBatch(), 50);    // scope = 50
+
+Valid range is 1–2,000. Sizing guidance:
+
+Scope	When
+1–50	Callout per record, heavy trigger cascades, complex DML, high CPU per record
+200	Straightforward field updates — the default is well-chosen for this
+500–2,000	Light read-mostly work where per-chunk overhead dominates
+
+The specific case worth remembering: if each record makes one callout, a scope of 100 hits the 100-callout limit exactly. Use 50 so you have room for retries or a second call.
+
+Two details that surprise people:
+
+If a chunk fails on a governor limit, the platform may automatically retry it with a reduced scope.
+Very small scopes on huge jobs produce enormous chunk counts, and each chunk counts against your daily async execution limit.
+
+***********************************************************************************************************************************************************************************************************************************************
+
+When to use Database.Stateful
+
+Default behavior: instance variables reset between every execute() call. Each chunk gets a fresh instance with only static final values intact. Database.Stateful serializes instance state and carries it across chunks.
+
+apex
+global class RevenueBatch implements Database.Batchable<sObject>, Database.Stateful {
+    global Integer processed = 0;
+    global Decimal total = 0;
+
+    global void execute(Database.BatchableContext bc, List<Opportunity> scope) {
+        for (Opportunity o : scope) {
+            processed++;
+            total += (o.Amount == null ? 0 : o.Amount);
+        }
+    }
+
+    global void finish(Database.BatchableContext bc) {
+        System.debug(processed + ' opps, ' + total);   // survived all chunks
+    }
+}
+
+*************************************************************************************************************************************************************************************************************************************************************
+
+Use it for:
+
+Running counters or aggregation totals reported in finish()
+A bounded error/failure list for a summary email
+An ID or config value captured in start() that finish() needs
+A flag deciding whether finish() should chain the next job
+
+Avoid it when:
+
+You don't actually need cross-chunk state — it adds serialization overhead on every chunk boundary and measurably slows the job
+You'd accumulate large collections. A List<String> of errors across millions of records will hit the 12 MB heap. Cap the list, or write failures to a custom object and query them in finish()
+
+Gotchas: only instance variables persist — statics still reset. Everything held must be serializable. And note that finish() can always query AsyncApexJob for JobItemsProcessed and NumberOfErrors, so if counts are all you need, you may not need Stateful at all.
+
+*************************************************************************************************************************************************************************************************************************************************************************************
+
+Callouts from batch
+
+Yes, with the marker interface:
+
+global class SyncBatch implements Database.Batchable<sObject>, 
+                                  Database.AllowsCallouts {
+
+    global Database.QueryLocator start(Database.BatchableContext bc) {
+        return Database.getQueryLocator([
+            SELECT Id, Name FROM Account WHERE Sync_Status__c = 'Pending'
+        ]);
+    }
+
+    global void execute(Database.BatchableContext bc, List<Account> scope) {
+        List<Account> toUpdate = new List<Account>();
+
+        for (Account a : scope) {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint('callout:ERP/api/accounts');
+            req.setMethod('POST');
+            req.setTimeout(20000);
+            req.setBody(JSON.serialize(new Map<String,Object>{'name' => a.Name}));
+
+            try {
+                HttpResponse res = new Http().send(req);
+                a.Sync_Status__c = (res.getStatusCode() == 200) ? 'Success' : 'Failed';
+            } catch (CalloutException e) {
+                a.Sync_Status__c = 'Failed';
+            }
+            toUpdate.add(a);
+        }
+
+        Database.update(toUpdate, false);
+    }
+
+    global void finish(Database.BatchableContext bc) { }
+}
+
+Launched with a scope that respects the callout limit:
+
+Database.executeBatch(new SyncBatch(), 50);
+
+Points that matter:
+
+Without Database.AllowsCallouts, a callout throws CalloutException — the interface is a pure marker, but it's mandatory.
+100 callouts per execute(), and the limit is per chunk, not per job. This is why scope size and callouts are coupled.
+There's also a 120-second cumulative callout timeout per transaction. Ten records at 20s each will blow it even though you're nowhere near 100 callouts. Set explicit setTimeout() values and size scope accordingly.
+Callouts are allowed in start() and finish() too, subject to the same limits.
+Wrap each callout in try/catch. An uncaught exception rolls back the entire chunk, losing every successful record in it.
+You cannot call a @future method from batch — System.AsyncException. If you need follow-up async work, enqueue a Queueable from finish().
+
+***********************************************************************************************************************************************************************************************************************
+
+One testing note
+
+In a test context, only one execute() invocation runs, regardless of scope size or how many records you inserted. Keep test data under a single chunk, or your assertions will silently pass against partial processing. To verify multi-chunk behavior — especially Database.Stateful accumulation — instantiate the class and call execute() directly with hand-built scopes.
